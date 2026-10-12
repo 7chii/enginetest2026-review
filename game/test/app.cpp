@@ -373,6 +373,9 @@ void App::frame() {
         if (selected) {
             ImGui::Separator();
             ImGui::Text("Objeto ID: %d", selected->id);
+            ImGui::Text("Physics: %s | Support: %s",
+                selected->isSleeping ? "sleeping" : "awake",
+                selected->supportIsStable ? "stable face" : "unstable / none");
             if (ImGui::DragFloat3("Posicao (XYZ)", &selected->pos.x, 0.05f)) {
                 selected->vel = glm::vec3(0.0f);
                 selected->angularVel = glm::vec3(0.0f);
@@ -463,11 +466,19 @@ void App::frame() {
         auto& rects = _scene.rectsRef();
         if (_playerShapeIndex >= rects.size()) return;
         Shape& mech = rects[_playerShapeIndex];
+        // Velocity of a kinematic platform is needed to transfer motion
+        // through its contacts. Yaw is also an angular contact velocity.
+        const glm::mat3 oldRotation = glm::mat3_cast(mech.rot);
+        const float previousYaw = std::atan2(oldRotation[2].x, oldRotation[2].z);
+        const float deltaYaw = std::remainder(_player.yaw - previousYaw,
+                                              6.2831853071795864769f);
         mech.pos = _player.position;
         mech.rot = glm::angleAxis(_player.yaw, glm::vec3(0.0f, 1.0f, 0.0f));
         mech.vel = _adminMode ? glm::vec3(0.0f) : _player.velocity;
         mech.vel.y = 0.0f;
-        mech.angularVel = glm::vec3(0.0f);
+        mech.angularVel = _adminMode || _deltaTime <= 0.0f
+            ? glm::vec3(0.0f)
+            : glm::vec3(0.0f, deltaYaw / _deltaTime, 0.0f);
         mech.isStatic = true;
         mech.useGravity = false;
         mech.geometryDirty = true;

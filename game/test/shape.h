@@ -60,6 +60,7 @@ struct Shape {
 
     bool useGravity = true;
     bool isGrounded = false;
+    bool supportIsStable = false; // stable face support: ground OR resting on another body
 
     bool isSleeping = false;
     float sleepTimer = 0.0f;

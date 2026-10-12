@@ -197,6 +197,7 @@ static void computePyramidFaces(Shape& p)
 
     // base
     glm::vec3 nBase = glm::normalize(glm::cross(v[1] - v[0], v[3] - v[0]));
+    if (glm::dot(nBase, p.pos - v[0]) > 0.0f) nBase = -nBase;
     faces[4].n = nBase;
     faces[4].d = -glm::dot(nBase, v[0]);
 }
@@ -410,54 +411,70 @@ static void applyImpulse(Shape& s, const glm::vec3& J, const glm::vec3& cp) {
 //----------------------------------------------------------
 // CONTATO C CHAO
 //----------------------------------------------------------
-static void solveGroundContact(Shape& s, const glm::vec3& cp, float dt)
+// Ground contact manifold. Resolve individual vertices, not one centroid:
+// impulses distributed over a flat face have no invented torque.
+static void solveGroundContact(Shape& s, const glm::vec3& /*cp*/, float /*dt*/)
 {
     if (s.isStatic || s.isDragging || s.isSleeping) return;
 
-    const glm::vec3 n(0.0f, 1.0f, 0.0f);
-    const float penetration = std::max(0.0f, -cp.y);
+    constexpr float skin = 0.002f;
+    constexpr float groundMargin = 0.013f;
+    constexpr float friction = 0.85f;
+    const glm::vec3 normal(0.0f, 1.0f, 0.0f);
+    const float invM = getInvMass(s);
+    const glm::mat3 invI = computeWorldInvInertia(s);
 
-    // Small positional correction, no launch from purely positional overlap.
-    const float slop = 0.002f;
-    const float correction = std::min(0.15f,
-        0.8f * std::max(0.0f, penetration - slop));
+    glm::vec3 contacts[5];
+    int contactCount = 0;
+    float lowest = FLT_MAX;
+    if (s.type == ShapeType::Sphere) {
+        lowest = s.pos.y - sphereRadius(s);
+        contacts[contactCount++] = s.pos - glm::vec3(0.0f, sphereRadius(s), 0.0f);
+    } else {
+        for (int i = 0; i < s.geometry.vertexCount; ++i)
+            lowest = std::min(lowest, s.geometry.vertices[i].y);
+        for (int i = 0; i < s.geometry.vertexCount && contactCount < 5; ++i) {
+            const glm::vec3 v = s.geometry.vertices[i];
+            if (v.y <= lowest + 0.012f) contacts[contactCount++] = v;
+        }
+    }
+    if (contactCount == 0 || lowest > groundMargin) return;
 
-    const glm::vec3 r = cp - s.pos;
+    const float correction = glm::clamp((skin - lowest) * 0.7f, 0.0f, 0.075f);
     if (correction > 0.0f) {
         s.pos.y += correction;
         s.geometryDirty = true;
     }
 
-    const float invM = getInvMass(s);
-    const glm::mat3 invI = computeWorldInvInertia(s);
-    glm::vec3 vContact = s.vel + glm::cross(s.angularVel, r);
-    const float vn = glm::dot(vContact, n);
+    // Several sequential passes for a resting box on four corners.
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int i = 0; i < contactCount; ++i) {
+            const glm::vec3 cp = contacts[i] + glm::vec3(0, correction, 0);
+            const glm::vec3 r = cp - s.pos;
+            glm::vec3 v = s.vel + glm::cross(s.angularVel, r);
+            const float vn = glm::dot(v, normal);
+            if (vn >= -1e-6f) continue;
+            const glm::vec3 rxn = glm::cross(r, normal);
+            const float denom = invM + glm::dot(invI * rxn, rxn);
+            if (denom < 1e-9f) continue;
+            const float restitution = (vn < -2.0f) ? 0.025f : 0.0f;
+            const float jn = -(1.0f + restitution) * vn / denom;
+            const glm::vec3 Jn = jn * normal;
+            s.vel += invM * Jn;
+            s.angularVel += invI * glm::cross(r, Jn);
 
-    float normalImpulse = 0.0f;
-    if (vn < -1e-5f) {
-        const glm::vec3 rxn = glm::cross(r, n);
-        const float denom = invM + glm::dot(invI * rxn, rxn);
-        if (denom > 1e-8f) {
-            // No micro-bounces at rest; only very small bounce for a hard drop.
-            const float e = (vn < -2.0f) ? 0.03f : 0.0f;
-            normalImpulse = -(1.0f + e) * vn / denom;
-            applyImpulse(s, normalImpulse * n, cp);
-        }
-    }
-
-    // Friction transmits horizontal momentum into angular momentum.
-    // Coulomb friction is limited by the normal impulse, not an arbitrary spin.
-    vContact = s.vel + glm::cross(s.angularVel, r);
-    glm::vec3 tangentVelocity = vContact - glm::dot(vContact, n) * n;
-    const float tangentSpeed = glm::length(tangentVelocity);
-    if (tangentSpeed > 1e-6f) {
-        const glm::vec3 t = -tangentVelocity / tangentSpeed;
-        const glm::vec3 rxt = glm::cross(r, t);
-        const float denomT = invM + glm::dot(invI * rxt, rxt);
-        if (denomT > 1e-8f) {
-            const float frictionLimit = frictionGround * normalImpulse;
-            const float jt = std::min(tangentSpeed / denomT, frictionLimit);
-            if (jt > 1e-8f) applyImpulse(s, jt * t, cp);
+            v = s.vel + glm::cross(s.angularVel, r);
+            glm::vec3 t = v - glm::dot(v, normal) * normal;
+            float speed = glm::length(t);
+            if (speed < 1e-7f) continue;
+            t /= speed;
+            const glm::vec3 rxt = glm::cross(r, t);
+            const float denomT = invM + glm::dot(invI * rxt, rxt);
+            if (denomT < 1e-9f) continue;
+            const float jt = std::min(speed / denomT, friction * jn);
+            const glm::vec3 Jt = -jt * t;
+            s.vel += invM * Jt;
+            s.angularVel += invI * glm::cross(r, Jt);
         }
     }
 }
@@ -562,43 +579,32 @@ static void handleGroundContact(Shape& s, float dt)
 {
     if (s.isStatic || s.isDragging) {
         s.isGrounded = false;
+        s.supportIsStable = false;
         return;
     }
-
     if (s.geometryDirty) {
         updateShapeWorldGeometry(s);
         s.geometryDirty = false;
     }
 
-    float minY = FLT_MAX;
-    glm::vec3 support(0.0f);
-
-    if (s.type == ShapeType::Sphere) {
-        const float r = sphereRadius(s);
-        minY = s.pos.y - r;
-        support = s.pos - glm::vec3(0.0f, r, 0.0f);
-    } else {
+    const float r = s.type == ShapeType::Sphere ? sphereRadius(s) : 0.0f;
+    float minY = s.type == ShapeType::Sphere ? s.pos.y - r : FLT_MAX;
+    if (s.type != ShapeType::Sphere)
         for (int i = 0; i < s.geometry.vertexCount; ++i)
             minY = std::min(minY, s.geometry.vertices[i].y);
 
-        // Average all near-lowest vertices. A box standing on its face should
-        // not receive its entire support impulse at an arbitrary corner.
-        glm::vec3 sum(0.0f);
-        int count = 0;
-        for (int i = 0; i < s.geometry.vertexCount; ++i) {
-            const glm::vec3& v = s.geometry.vertices[i];
-            if (v.y <= minY + 0.02f) {
-                sum += v;
-                ++count;
-            }
-        }
-        if (count > 0) support = sum / static_cast<float>(count);
-        support.y = minY;
-    }
+    s.isGrounded = minY <= 0.013f;
+    // Non-spherical objects require an actual face, rather than an unstable
+    // single vertex / edge, before they may go to sleep on the floor.
+    int nearCount = 0;
+    if (s.type != ShapeType::Sphere)
+        for (int i = 0; i < s.geometry.vertexCount; ++i)
+            if (s.geometry.vertices[i].y <= minY + 0.012f) ++nearCount;
+    s.supportIsStable = s.isGrounded &&
+        (s.type == ShapeType::Sphere || nearCount >= 3);
 
-    s.isGrounded = (minY <= 0.012f);
     if (s.isGrounded && !s.isSleeping)
-        solveGroundContact(s, support, dt);
+        solveGroundContact(s, glm::vec3(0.0f, minY, 0.0f), dt);
 }
 
 static bool isPointInsideBoxTopFace(const Shape& box, const glm::vec3& worldPoint)
@@ -1074,139 +1080,370 @@ inline bool findLocalSupport(const Shape& s,
 //----------------------------------------------------------
 // --- helpers para estabilidade entre box <-> pyramid ---------------------------------
 
+// Contact manifold (rect/rect, rect/pyramid, pyramid/pyramid).
+// SAT gives a separation normal; clipping the incident polygon against
+// the reference polygon gives the actual face contact patch (up to 4 points).
+struct ContactPolygon {
+    glm::vec3 vertices[8];
+    int count = 0;
+    glm::vec3 normal = glm::vec3(0.0f);
+};
+
+static void sortPolygon(ContactPolygon& p) {
+    if (p.count < 3) return;
+    glm::vec3 center(0.0f);
+    for (int i = 0; i < p.count; ++i) center += p.vertices[i];
+    center /= static_cast<float>(p.count);
+    const glm::vec3 seed = std::abs(p.normal.y) < 0.85f
+        ? glm::vec3(0, 1, 0) : glm::vec3(1, 0, 0);
+    const glm::vec3 u = glm::normalize(glm::cross(seed, p.normal));
+    const glm::vec3 v = glm::cross(p.normal, u);
+    std::sort(p.vertices, p.vertices + p.count, [&](glm::vec3 a, glm::vec3 b) {
+        return std::atan2(glm::dot(a - center, v), glm::dot(a - center, u)) <
+               std::atan2(glm::dot(b - center, v), glm::dot(b - center, u));
+    });
+}
+
+static ContactPolygon supportingFace(const Shape& s, const glm::vec3& direction,
+                                     float* outAlignment = nullptr) {
+    ContactPolygon p;
+    float bestAlignment = -FLT_MAX;
+    if (s.type == ShapeType::Rect) {
+        const glm::mat3 R = glm::mat3_cast(s.rot);
+        int axis = 0;
+        float sign = 1.0f;
+        for (int i = 0; i < 3; ++i)
+            for (float side : { -1.0f, 1.0f }) {
+                const float score = glm::dot(side * R[i], direction);
+                if (score > bestAlignment) {
+                    bestAlignment = score;
+                    axis = i;
+                    sign = side;
+                }
+            }
+        p.normal = sign * R[axis];
+        const glm::vec3 half = s.scale * 0.5f;
+        for (int i = 0; i < 8; ++i) {
+            const glm::vec3 local((i & 4) ? half.x : -half.x,
+                                  (i & 2) ? half.y : -half.y,
+                                  (i & 1) ? half.z : -half.z);
+            if ((sign > 0.0f) == (local[axis] > 0.0f))
+                p.vertices[p.count++] = s.pos + R * local;
+        }
+    } else if (s.type == ShapeType::Pyramid) {
+        constexpr int faceSizes[5] = {3, 3, 3, 3, 4};
+        constexpr int faceIDs[5][4] = {
+            {0,1,4,0}, {1,2,4,0}, {2,3,4,0}, {3,0,4,0}, {0,1,2,3}
+        };
+        int face = -1;
+        for (int i = 0; i < 5; ++i) {
+            const float score = glm::dot(s.geometry.faces[i].n, direction);
+            if (score > bestAlignment) {
+                bestAlignment = score;
+                face = i;
+            }
+        }
+        if (face >= 0) {
+            p.normal = s.geometry.faces[face].n;
+            p.count = faceSizes[face];
+            for (int i = 0; i < p.count; ++i)
+                p.vertices[i] = s.geometry.vertices[faceIDs[face][i]];
+        }
+    }
+    if (outAlignment) *outAlignment = bestAlignment;
+    sortPolygon(p);
+    return p;
+}
+
+static int contactPatch(const Contact& c, glm::vec3 (&points)[4]) {
+    points[0] = c.point;
+    if ((c.a->type != ShapeType::Rect && c.a->type != ShapeType::Pyramid) ||
+        (c.b->type != ShapeType::Rect && c.b->type != ShapeType::Pyramid)) return 1;
+
+    float alignA, alignB;
+    ContactPolygon refA = supportingFace(*c.a, c.normal, &alignA);
+    ContactPolygon refB = supportingFace(*c.b, -c.normal, &alignB);
+    if (std::max(alignA, alignB) < 0.92f) return 1; // edge-edge
+    const bool referenceIsA = alignA >= alignB;
+    ContactPolygon reference = referenceIsA ? refA : refB;
+    ContactPolygon incident = supportingFace(referenceIsA ? *c.b : *c.a,
+                                            -reference.normal);
+    if (reference.count < 3 || incident.count < 3) return 1;
+
+    // Clip against four/three planes of the reference face.
+    glm::vec3 clipped[16];
+    int count = incident.count;
+    for (int i = 0; i < count; ++i) clipped[i] = incident.vertices[i];
+    for (int edge = 0; edge < reference.count && count; ++edge) {
+        glm::vec3 output[16];
+        int outCount = 0;
+        const glm::vec3 a = reference.vertices[edge];
+        const glm::vec3 b = reference.vertices[(edge + 1) % reference.count];
+        const glm::vec3 inside = glm::cross(reference.normal, b - a);
+        for (int i = 0; i < count; ++i) {
+            const glm::vec3 p0 = clipped[i];
+            const glm::vec3 p1 = clipped[(i + 1) % count];
+            const float d0 = glm::dot(inside, p0 - a);
+            const float d1 = glm::dot(inside, p1 - a);
+            if ((d0 >= 0.0f) != (d1 >= 0.0f)) {
+                const float fraction = d0 / (d0 - d1);
+                if (outCount < 16) output[outCount++] = glm::mix(p0, p1, fraction);
+            }
+            if (d1 >= -1e-5f && outCount < 16) output[outCount++] = p1;
+        }
+        count = outCount;
+        for (int i = 0; i < count; ++i) clipped[i] = output[i];
+    }
+
+    glm::vec3 candidates[16];
+    int n = 0;
+    for (int i = 0; i < count; ++i) {
+        const float separation = glm::dot(reference.normal,
+                                          clipped[i] - reference.vertices[0]);
+        if (separation > 0.025f) continue;
+        glm::vec3 midpoint = clipped[i] - 0.5f * separation * reference.normal;
+        bool duplicate = false;
+        for (int k = 0; k < n; ++k)
+            if (glm::length2(candidates[k] - midpoint) < 1e-6f) duplicate = true;
+        if (!duplicate && n < 16) candidates[n++] = midpoint;
+    }
+    if (!n) return 1;
+    if (n <= 4) {
+        for (int i = 0; i < n; ++i) points[i] = candidates[i];
+        return n;
+    }
+
+    // Pick four spread-out points from a larger clipped polygon.
+    glm::vec3 centroid(0.0f);
+    for (int i = 0; i < n; ++i) centroid += candidates[i];
+    centroid /= static_cast<float>(n);
+    const glm::vec3 seed = std::abs(reference.normal.y) < 0.85f
+        ? glm::vec3(0,1,0) : glm::vec3(1,0,0);
+    const glm::vec3 u = glm::normalize(glm::cross(seed, reference.normal));
+    const glm::vec3 v = glm::cross(reference.normal, u);
+    const glm::vec3 dirs[4] = {u, v, -u, -v};
+    int selected = 0;
+    for (glm::vec3 direction : dirs) {
+        float best = -FLT_MAX;
+        int bestIdx = -1;
+        for (int i = 0; i < n; ++i) {
+            bool used = false;
+            for (int k = 0; k < selected; ++k)
+                if (glm::length2(points[k] - candidates[i]) < 1e-6f) used = true;
+            const float score = glm::dot(candidates[i] - centroid, direction);
+            if (!used && score > best) { best = score; bestIdx = i; }
+        }
+        if (bestIdx >= 0) points[selected++] = candidates[bestIdx];
+    }
+    return selected > 0 ? selected : 1;
+}
+
+static bool centerOverSupportFace(const Shape& base, const Shape& top) {
+    if (base.type == ShapeType::Sphere) return false;
+    float align;
+    ContactPolygon face = supportingFace(base, glm::vec3(0,1,0), &align);
+    if (align < 0.85f || face.count < 3) return false;
+    // Point-in-polygon on horizontal plane: COM must project inside footprint.
+    // Being supported by an edge alone does not qualify for sleep.
+    bool inside = false;
+    const float x = top.pos.x, z = top.pos.z;
+    for (int i = 0, j = face.count - 1; i < face.count; j = i++) {
+        const glm::vec3 a = face.vertices[i], b = face.vertices[j];
+        const bool crosses = ((a.z > z) != (b.z > z)) &&
+            (x < (b.x - a.x) * (z - a.z) / (b.z - a.z) + a.x);
+        if (crosses) inside = !inside;
+    }
+    return inside;
+}
+
+static bool stationarySupport(const Shape& s) {
+    return s.isStatic || s.isSleeping ||
+           (s.isGrounded && glm::length2(s.vel) < 0.15f*0.15f &&
+            glm::length2(s.angularVel) < 0.12f*0.12f);
+}
+
+static void markSupport(const Contact& c, const glm::vec3 (&points)[4], int contactCount) {
+    if (std::abs(c.normal.y) < 0.62f || c.penetration < -0.01f) return;
+    Shape& top = c.normal.y > 0.0f ? *c.b : *c.a;
+    const Shape& base = c.normal.y > 0.0f ? *c.a : *c.b;
+    if (top.isStatic || top.isDragging) return;
+    top.isGrounded = true;
+    // A wide support polygon is necessary for a sleeping box/pyramid.
+    // Three nearly-collinear contacts at a balancing edge are NOT a face.
+    float maxArea2 = 0.0f;
+    for (int i = 0; i < contactCount; ++i)
+        for (int j = i + 1; j < contactCount; ++j)
+            for (int k = j + 1; k < contactCount; ++k)
+                maxArea2 = std::max(maxArea2, glm::length(
+                    glm::cross(points[j]-points[i], points[k]-points[i])));
+    float topAlignment = 1.0f;
+    if (top.type != ShapeType::Sphere)
+        (void)supportingFace(top, glm::vec3(0,-1,0), &topAlignment);
+    const bool faceContact = top.type == ShapeType::Sphere ||
+        (contactCount >= 3 && maxArea2 > 0.003f && topAlignment > 0.985f);
+    if (stationarySupport(base) && faceContact && centerOverSupportFace(base, top))
+        top.supportIsStable = true;
+}
+
 static void solveContact(Contact& c, float /*dt*/)
 {
     Shape& A = *c.a;
     Shape& B = *c.b;
-    if ((A.isStatic || A.isDragging) && (B.isStatic || B.isDragging)) return;
-
     const float n2 = glm::length2(c.normal);
-    if (n2 < 1e-10f || c.penetration <= 0.0f) return;
+    if (n2 < 1e-10f || c.penetration < 0.0f) return;
     const glm::vec3 n = c.normal / std::sqrt(n2);
 
-    const glm::vec3 rA = c.point - A.pos;
-    const glm::vec3 rB = c.point - B.pos;
-    glm::vec3 vA = A.vel + glm::cross(A.angularVel, rA);
-    glm::vec3 vB = B.vel + glm::cross(B.angularVel, rB);
-    glm::vec3 rv = vB - vA;
-    const float vn = glm::dot(rv, n);
+    glm::vec3 points[4];
+    const int pointCount = contactPatch(c, points);
+    markSupport(c, points, pointCount);
 
-    // Sleeping dynamic bodies should wake when hit by a moving player or body.
-    // They must never be converted into isStatic=true by the sleep system.
-    if (vn < -0.03f || c.penetration > 0.03f) {
-        if (!A.isStatic && !A.isDragging) wake(A);
-        if (!B.isStatic && !B.isDragging) wake(B);
+    // A resting body must remain dynamic. Wake it for a real impact, a
+    // substantially displaced support, or contact with a moving platform.
+    const glm::vec3 rvCenter = B.vel - A.vel;
+    const float closing = glm::dot(rvCenter, n);
+    const float relativeSpeed2 = glm::length2(rvCenter);
+    const bool movingKinematicSupport =
+        ((A.isStatic || A.isDragging) && glm::length2(A.vel) > 0.10f*0.10f) ||
+        ((B.isStatic || B.isDragging) && glm::length2(B.vel) > 0.10f*0.10f);
+    if (closing < -0.24f || c.penetration > 0.035f ||
+        (movingKinematicSupport && relativeSpeed2 > 0.10f*0.10f)) {
+        if (A.isSleeping && !A.isStatic && !A.isDragging) wake(A);
+        if (B.isSleeping && !B.isStatic && !B.isDragging) wake(B);
     }
 
-    const float invMA = getInvMass(A);
-    const float invMB = getInvMass(B);
+    // Treat a sleeping body as immovable for tiny resting impulses. Gravity
+    // and integration resume after wake, so an anchored tower doesn't buzz.
+    const float invMA = A.isSleeping ? 0.0f : getInvMass(A);
+    const float invMB = B.isSleeping ? 0.0f : getInvMass(B);
     if (invMA + invMB < 1e-9f) return;
-    const glm::mat3 invIA = computeWorldInvInertia(A);
-    const glm::mat3 invIB = computeWorldInvInertia(B);
+    const glm::mat3 invIA = A.isSleeping ? glm::mat3(0.0f) : computeWorldInvInertia(A);
+    const glm::mat3 invIB = B.isSleeping ? glm::mat3(0.0f) : computeWorldInvInertia(B);
 
-    // Positional correction has no velocity component and cannot fling objects.
-    constexpr float slop = 0.003f;
-    constexpr float percent = 0.65f;
-    const float correction = std::min(0.16f,
+    // Position correction only once per manifold, not at each vertex.
+    // Sleeping bodies keep their exact transforms until explicitly woken.
+    constexpr float slop = 0.002f;
+    constexpr float percent = 0.35f;
+    const float correction = std::min(0.06f,
         percent * std::max(0.0f, c.penetration - slop) / (invMA + invMB));
     if (correction > 0.0f) {
-        if (invMA > 0.0f) {
-            A.pos -= correction * invMA * n;
-            A.geometryDirty = true;
+        if (invMA > 0.0f) { A.pos -= correction * invMA * n; A.geometryDirty = true; }
+        if (invMB > 0.0f) { B.pos += correction * invMB * n; B.geometryDirty = true; }
+    }
+
+    // Sequential impulses across the whole contact patch. Multiple contact
+    // points counteract artificial spin from one arbitrarily chosen centroid.
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int k = 0; k < pointCount; ++k) {
+            const glm::vec3 cp = points[k];
+            const glm::vec3 rA = cp - A.pos;
+            const glm::vec3 rB = cp - B.pos;
+            glm::vec3 vA = A.vel + glm::cross(A.angularVel, rA);
+            glm::vec3 vB = B.vel + glm::cross(B.angularVel, rB);
+            glm::vec3 rv = vB - vA;
+            const float vn = glm::dot(rv, n);
+            if (vn >= -1e-6f) continue;
+            const glm::vec3 rAxn = glm::cross(rA, n);
+            const glm::vec3 rBxn = glm::cross(rB, n);
+            const float denomN = invMA + invMB +
+                glm::dot(invIA * rAxn, rAxn) + glm::dot(invIB * rBxn, rBxn);
+            if (denomN < 1e-9f) continue;
+            const float e = vn < -2.0f ? 0.035f : 0.0f;
+            const float jn = -(1.0f + e) * vn / denomN;
+            const glm::vec3 Jn = jn * n;
+            A.vel -= invMA * Jn;
+            B.vel += invMB * Jn;
+            A.angularVel -= invIA * glm::cross(rA, Jn);
+            B.angularVel += invIB * glm::cross(rB, Jn);
+
+            vA = A.vel + glm::cross(A.angularVel, rA);
+            vB = B.vel + glm::cross(B.angularVel, rB);
+            rv = vB - vA;
+            glm::vec3 t = rv - glm::dot(rv, n) * n;
+            const float vt = glm::length(t);
+            if (vt < 1e-7f) continue;
+            t /= vt;
+            const glm::vec3 rAt = glm::cross(rA, t);
+            const glm::vec3 rBt = glm::cross(rB, t);
+            const float denomT = invMA + invMB +
+                glm::dot(invIA * rAt, rAt) + glm::dot(invIB * rBt, rBt);
+            if (denomT < 1e-9f) continue;
+            const float jt = std::min(vt / denomT, 0.85f * jn);
+            const glm::vec3 Jt = -jt * t;
+            A.vel -= invMA * Jt;
+            B.vel += invMB * Jt;
+            A.angularVel -= invIA * glm::cross(rA, Jt);
+            B.angularVel += invIB * glm::cross(rB, Jt);
         }
-        if (invMB > 0.0f) {
-            B.pos += correction * invMB * n;
-            B.geometryDirty = true;
-        }
-    }
-
-    // Only closing contacts receive a normal impulse. A moving kinematic
-    // mech has invMass=0 but *nonzero* velocity for relative contact motion.
-    if (vn >= -1e-5f) return;
-    const glm::vec3 rAxn = glm::cross(rA, n);
-    const glm::vec3 rBxn = glm::cross(rB, n);
-    const float denomN = invMA + invMB +
-        glm::dot(invIA * rAxn, rAxn) + glm::dot(invIB * rBxn, rBxn);
-    if (denomN <= 1e-8f) return;
-
-    const float e = (vn < -1.5f) ? 0.08f : 0.0f;
-    const float jn = -(1.0f + e) * vn / denomN;
-    const glm::vec3 impulseN = jn * n;
-    if (invMA > 0.0f) {
-        A.vel -= invMA * impulseN;
-        A.angularVel -= invIA * glm::cross(rA, impulseN);
-    }
-    if (invMB > 0.0f) {
-        B.vel += invMB * impulseN;
-        B.angularVel += invIB * glm::cross(rB, impulseN);
-    }
-
-    // Coulomb friction also changes the angular velocity (rolling).
-    vA = A.vel + glm::cross(A.angularVel, rA);
-    vB = B.vel + glm::cross(B.angularVel, rB);
-    rv = vB - vA;
-    glm::vec3 t = rv - glm::dot(rv, n) * n;
-    const float vt = glm::length(t);
-    if (vt < 1e-6f) return;
-    t /= vt;
-
-    const glm::vec3 rAt = glm::cross(rA, t);
-    const glm::vec3 rBt = glm::cross(rB, t);
-    const float denomT = invMA + invMB +
-        glm::dot(invIA * rAt, rAt) + glm::dot(invIB * rBt, rBt);
-    if (denomT <= 1e-8f) return;
-
-    float jt = -glm::dot(rv, t) / denomT;
-    jt = glm::clamp(jt, -frictionGround * jn, frictionGround * jn);
-    const glm::vec3 impulseT = jt * t;
-    if (invMA > 0.0f) {
-        A.vel -= invMA * impulseT;
-        A.angularVel -= invIA * glm::cross(rA, impulseT);
-    }
-    if (invMB > 0.0f) {
-        B.vel += invMB * impulseT;
-        B.angularVel += invIB * glm::cross(rB, impulseT);
     }
 }
 
 // --- Sphere x Pyramid (face contact robusta) ---
+// Closest point on a triangle (Ericson, Real-Time Collision Detection).
+static glm::vec3 closestPointTriangle(const glm::vec3& p,
+                                     const glm::vec3& a,
+                                     const glm::vec3& b,
+                                     const glm::vec3& c) {
+    const glm::vec3 ab = b-a, ac = c-a, ap = p-a;
+    const float d1 = glm::dot(ab,ap), d2 = glm::dot(ac,ap);
+    if (d1 <= 0 && d2 <= 0) return a;
+    const glm::vec3 bp = p-b;
+    const float d3 = glm::dot(ab,bp), d4 = glm::dot(ac,bp);
+    if (d3 >= 0 && d4 <= d3) return b;
+    const float vc = d1*d4 - d3*d2;
+    if (vc <= 0 && d1 >= 0 && d3 <= 0) return a + (d1/(d1-d3))*ab;
+    const glm::vec3 cp = p-c;
+    const float d5 = glm::dot(ab,cp), d6 = glm::dot(ac,cp);
+    if (d6 >= 0 && d5 <= d6) return c;
+    const float vb = d5*d2 - d1*d6;
+    if (vb <= 0 && d2 >= 0 && d6 <= 0) return a + (d2/(d2-d6))*ac;
+    const float va = d3*d6 - d5*d4;
+    if (va <= 0 && (d4-d3) >= 0 && (d5-d6) >= 0)
+        return b + ((d4-d3)/((d4-d3)+(d5-d6)))*(c-b);
+    const float denom = 1.0f/(va+vb+vc);
+    return a + ab*(vb*denom) + ac*(vc*denom);
+}
+
 static bool spherePyramid(Shape& sphere, Shape& pyr, Contact& c)
 {
-    float r = sphereRadius(sphere);
-
-    const auto& faces = pyr.geometry.faces;
-    int faceCount = pyr.geometry.faceCount;
-
-    float maxSeparation = -FLT_MAX;
-    int maxIdx = -1;
-
-    glm::vec3 sphereCenter = sphere.pos;
-
-    for (int i = 0; i < faceCount; ++i)
-    {
-        float d = glm::dot(faces[i].n, sphereCenter) + faces[i].d;
-
-        if (d > r)
-            return false;
-
-        if (d > maxSeparation)
-        {
-            maxSeparation = d;
-            maxIdx = i;
+    const float r = sphereRadius(sphere);
+    // Six triangles cover pyramid's base and four lateral faces.
+    constexpr int triangles[6][3] = {
+        {0,1,2}, {0,2,3}, {0,1,4}, {1,2,4}, {2,3,4}, {3,0,4}
+    };
+    glm::vec3 closest(0.0f);
+    float dist2 = FLT_MAX;
+    for (auto const& tri : triangles) {
+        const glm::vec3 q = closestPointTriangle(sphere.pos,
+            pyr.geometry.vertices[tri[0]], pyr.geometry.vertices[tri[1]],
+            pyr.geometry.vertices[tri[2]]);
+        const float d2 = glm::length2(q - sphere.pos);
+        if (d2 < dist2) { dist2 = d2; closest = q; }
+    }
+    bool inside = true;
+    float nearestExit = -FLT_MAX;
+    glm::vec3 exitNormal(0,1,0);
+    for (int i = 0; i < pyr.geometry.faceCount; ++i) {
+        const float distance = glm::dot(pyr.geometry.faces[i].n, sphere.pos)
+                               + pyr.geometry.faces[i].d;
+        if (distance > 0) inside = false;
+        if (distance > nearestExit) {
+            nearestExit = distance;
+            exitNormal = pyr.geometry.faces[i].n;
         }
     }
-
-    if (maxIdx == -1)
-        return false;
-
-    const Face& refFace = faces[maxIdx];
-
+    if (!inside && dist2 > r*r) return false;
     c.a = &pyr;
     c.b = &sphere;
-    c.normal = refFace.n;
-    c.penetration = r - maxSeparation;
-    c.point = sphereCenter - refFace.n * r;
-
+    if (inside) {
+        c.normal = exitNormal;
+        c.penetration = r - nearestExit;
+        c.point = closest;
+    } else {
+        const float dist = std::sqrt(dist2);
+        c.normal = dist > 1e-6f ? (sphere.pos - closest)/dist : exitNormal;
+        c.penetration = r - dist;
+        c.point = closest;
+    }
     return true;
 }
 //----------------------------------------------------------
@@ -1338,6 +1575,47 @@ static bool boxPyramid(const Shape& box, const Shape& pyr, Contact& c)
     return true;
 }
 
+static bool pyramidPyramid(const Shape& a, const Shape& b, Contact& c)
+{
+    float minOverlap = FLT_MAX;
+    glm::vec3 bestAxis(0.0f);
+    auto testAxis = [&](glm::vec3 axis) -> bool {
+        const float len2 = glm::length2(axis);
+        if (len2 < 1e-8f) return true;
+        axis /= std::sqrt(len2);
+        float minA,maxA,minB,maxB;
+        projectPoints(a.geometry.vertices, a.geometry.vertexCount, axis, minA,maxA);
+        projectPoints(b.geometry.vertices, b.geometry.vertexCount, axis, minB,maxB);
+        const float overlap = std::min(maxA,maxB)-std::max(minA,minB);
+        if (overlap < 0.0f) return false;
+        if (overlap < minOverlap) {
+            minOverlap = overlap;
+            bestAxis = glm::dot(b.pos-a.pos,axis) >= 0 ? axis : -axis;
+        }
+        return true;
+    };
+    for (int i=0;i<a.geometry.faceCount;++i)
+        if (!testAxis(a.geometry.faces[i].n)) return false;
+    for (int i=0;i<b.geometry.faceCount;++i)
+        if (!testAxis(b.geometry.faces[i].n)) return false;
+    constexpr int edges[8][2] = {
+        {0,1}, {1,2}, {2,3}, {3,0}, {0,4}, {1,4}, {2,4}, {3,4}
+    };
+    for (const auto& ea : edges) for (const auto& eb : edges) {
+        const glm::vec3 da = a.geometry.vertices[ea[1]]-a.geometry.vertices[ea[0]];
+        const glm::vec3 db = b.geometry.vertices[eb[1]]-b.geometry.vertices[eb[0]];
+        if (!testAxis(glm::cross(da,db))) return false;
+    }
+    if (glm::length2(bestAxis) < 0.5f) return false;
+    c.a = const_cast<Shape*>(&a);
+    c.b = const_cast<Shape*>(&b);
+    c.normal = bestAxis;
+    c.penetration = minOverlap;
+    c.point = 0.5f * (averageExtremeVertices(a,bestAxis) +
+                      averageExtremeVertices(b,-bestAxis));
+    return true;
+}
+
 static bool sphereBox(Shape& sphere, Shape& box, Contact& c)
 {
     // Resolve the closest point in the oriented box's LOCAL coordinate space.
@@ -1383,15 +1661,21 @@ static bool sphereBox(Shape& sphere, Shape& box, Contact& c)
 static void updateSleepState(Shape& s, float dt)
 {
     if (s.isStatic || s.isDragging) return;
-    if (s.isSleeping) return;
-    const bool slow = glm::length2(s.vel) < 0.025f * 0.025f &&
-                      glm::length2(s.angularVel) < 0.04f * 0.04f;
-    if (!s.isGrounded || !slow) {
+    if (s.isSleeping) {
+        // Moving a support away (or losing balance) wakes a resting body.
+        if (!s.isGrounded || !s.supportIsStable) wake(s);
+        return;
+    }
+    const float linearThreshold = 0.085f;
+    const float angularThreshold = 0.075f;
+    const bool quiet = glm::length2(s.vel) < linearThreshold*linearThreshold &&
+                       glm::length2(s.angularVel) < angularThreshold*angularThreshold;
+    if (!quiet || !s.isGrounded || !s.supportIsStable) {
         s.sleepTimer = 0.0f;
         return;
     }
     s.sleepTimer += dt;
-    if (s.sleepTimer >= 0.85f) {
+    if (s.sleepTimer >= 0.65f) {
         s.isSleeping = true;
         s.vel = glm::vec3(0.0f);
         s.angularVel = glm::vec3(0.0f);
@@ -1417,18 +1701,19 @@ static void physicsSubstep(Scene& scene, float dt)
             s.geometryDirty = false;
         }
     };
-
     applyToAll([&](Shape& s) {
         integrateGravity(s, dt);
         integratePosition(s, dt);
         integrateRotation(s, dt);
     });
-    applyToAll(updateGeometry);
-    applyToAll([&](Shape& s) { handleGroundContact(s, dt); });
-    applyToAll(updateGeometry);
 
-    // Iterative contact resolution is much more stable for stacked bodies.
-    for (int iteration = 0; iteration < 3; ++iteration) {
+    // Contacts must be recomputed as shapes move, including all floors and
+    // pyramid/pyramid pairs. Previously only 3 solver passes were used.
+    for (int iteration = 0; iteration < 8; ++iteration) {
+        applyToAll(updateGeometry);
+        applyToAll([&](Shape& s) { handleGroundContact(s, dt); });
+        applyToAll(updateGeometry);
+
         std::vector<AABB> sphereAABB(spheres.size());
         std::vector<AABB> boxAABB(boxes.size());
         std::vector<AABB> pyramidAABB(pyramids.size());
@@ -1465,7 +1750,10 @@ static void physicsSubstep(Scene& scene, float dt)
                 if (aabbOverlap(sphereAABB[i], pyramidAABB[j]) &&
                     spherePyramid(spheres[i], pyramids[j], c)) solveContact(c, dt);
 
-        applyToAll(updateGeometry);
+        for (size_t i = 0; i < pyramids.size(); ++i)
+            for (size_t j = i + 1; j < pyramids.size(); ++j)
+                if (aabbOverlap(pyramidAABB[i], pyramidAABB[j]) &&
+                    pyramidPyramid(pyramids[i], pyramids[j], c)) solveContact(c, dt);
     }
     applyToAll([&](Shape& s) { updateSleepState(s, dt); });
 }
@@ -1473,7 +1761,9 @@ static void physicsSubstep(Scene& scene, float dt)
 void updatePhysics(Scene& scene, float dt)
 {
     if (dt <= 0.0f) return;
-    // Short bounded substeps avoid large deep penetrations and floor jitter.
+    // Bound the accumulated frame time rather than integrating a huge step
+    // after alt-tab, a breakpoint, or a stalled frame.
+    dt = std::min(dt, 1.0f / 20.0f);
     const int substeps = std::clamp(static_cast<int>(std::ceil(dt / (1.0f / 120.0f))), 1, 8);
     const float h = dt / static_cast<float>(substeps);
     for (int i = 0; i < substeps; ++i) physicsSubstep(scene, h);
