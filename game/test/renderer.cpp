@@ -6,6 +6,8 @@
 #include <glm/gtc/quaternion.hpp>
 
 #include <vector>
+#include <array>
+#include <cmath>
 #include <algorithm>
 #include <iostream>
 
@@ -23,6 +25,7 @@ struct Renderer::Impl {
     unsigned int vaoPyramid = 0;
     unsigned int vaoRect = 0;
     unsigned int vaoSphere = 0;
+    unsigned int shotVAO = 0, shotVBO = 0;
     unsigned int sphereIndexCount = 0;
     glm::vec3 prevCameraPos = glm::vec3(0.0f);
     float lastMouseX = 600.0f, lastMouseY = 400.0f;
@@ -292,6 +295,16 @@ void main() {
 
     _p->vaoSphere = vaoS;
     _p->sphereIndexCount = (int)sphereIndices.size();
+
+    // Reusable dynamic triangle buffer for impact decals and the laser beam.
+    glGenVertexArrays(1, &_p->shotVAO);
+    glGenBuffers(1, &_p->shotVBO);
+    glBindVertexArray(_p->shotVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, _p->shotVBO);
+    glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), nullptr);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
 }
 
 void Renderer::draw(const Scene& scene, const Camera& cam) {
@@ -444,3 +457,107 @@ glm::vec3 Renderer::getPrevCameraPos() const { return _p->prevCameraPos; }
 void Renderer::setLastMouse(float x, float y) { _p->lastMouseX = x; _p->lastMouseY = y; }
 float Renderer::getLastX() const { return _p->lastMouseX; }
 float Renderer::getLastY() const { return _p->lastMouseY; }
+
+void Renderer::drawShots(const Scene& scene, const Camera& cam,
+                         const std::vector<ShotMark>& marks,
+                         const ShotBeam* beam) {
+    if (marks.empty() && !beam) return;
+
+    const glm::mat4 view = glm::lookAt(cam.pos, cam.pos + cam.front, cam.up);
+    GLint viewport[4] = {};
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    const float aspect = static_cast<float>(viewport[2]) /
+                         static_cast<float>(std::max(viewport[3], 1));
+    const glm::mat4 projection = glm::perspective(glm::radians(45.0f),
+                                                  aspect, 0.1f, 100.0f);
+    glUseProgram(_p->shaderProgram);
+    glUniformMatrix4fv(glGetUniformLocation(_p->shaderProgram, "view"), 1,
+                       GL_FALSE, glm::value_ptr(view));
+    glUniformMatrix4fv(glGetUniformLocation(_p->shaderProgram, "projection"), 1,
+                       GL_FALSE, glm::value_ptr(projection));
+    const glm::mat4 identity(1.0f);
+    glUniformMatrix4fv(glGetUniformLocation(_p->shaderProgram, "model"), 1,
+                       GL_FALSE, glm::value_ptr(identity));
+
+    // Draw a small, surface-oriented square (same world-space width as beam).
+    constexpr float width = 0.075f;
+    constexpr float surfaceOffset = 0.012f;
+    std::vector<glm::vec3> decals;
+    decals.reserve(marks.size() * 6);
+    for (const ShotMark& mark : marks) {
+        if (mark.shapeIndex < 0) continue;
+        const std::vector<Shape>* list = nullptr;
+        if (mark.type == ShapeType::Rect) list = &scene.rectsRef();
+        if (mark.type == ShapeType::Pyramid) list = &scene.pyramidsRef();
+        if (mark.type == ShapeType::Sphere) list = &scene.spheresRef();
+        if (!list || static_cast<std::size_t>(mark.shapeIndex) >= list->size())
+            continue;
+        const Shape& shape = (*list)[static_cast<std::size_t>(mark.shapeIndex)];
+        if (shape.id != mark.shapeId) continue;
+        const glm::vec3 normal = glm::normalize(shape.rot * mark.localNormal);
+        const glm::vec3 origin = shape.pos + shape.rot * mark.localPoint +
+                                 normal * surfaceOffset;
+        const glm::vec3 helper = std::abs(normal.y) > 0.9f
+            ? glm::vec3(1, 0, 0) : glm::vec3(0, 1, 0);
+        const glm::vec3 tangent = glm::normalize(glm::cross(helper, normal)) * (width * 0.5f);
+        const glm::vec3 bitangent = glm::normalize(glm::cross(normal, tangent)) * (width * 0.5f);
+        const glm::vec3 a = origin - tangent - bitangent;
+        const glm::vec3 b = origin + tangent - bitangent;
+        const glm::vec3 c = origin + tangent + bitangent;
+        const glm::vec3 d = origin - tangent + bitangent;
+        decals.insert(decals.end(), {a, b, c, a, c, d});
+    }
+
+    auto drawTriangles = [&](const std::vector<glm::vec3>& vertices,
+                             const glm::vec3& color) {
+        if (vertices.empty()) return;
+        glUniform3fv(glGetUniformLocation(_p->shaderProgram, "color"),
+                     1, glm::value_ptr(color));
+        glBindVertexArray(_p->shotVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, _p->shotVBO);
+        glBufferData(GL_ARRAY_BUFFER,
+                     static_cast<GLsizeiptr>(vertices.size() * sizeof(glm::vec3)),
+                     vertices.data(), GL_DYNAMIC_DRAW);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(vertices.size()));
+    };
+
+    // Respect depth: a mark cannot show through another object.
+    glEnable(GL_DEPTH_TEST);
+    drawTriangles(decals, glm::vec3(0.98f, 0.035f, 0.035f));
+
+    if (beam) {
+        const glm::vec3 path = beam->end - beam->start;
+        const float length2 = glm::dot(path, path);
+        if (length2 > 1.0e-6f) {
+            const glm::vec3 axis = glm::normalize(path);
+            const glm::vec3 helper = std::abs(axis.y) > 0.95f
+                ? glm::vec3(1, 0, 0) : glm::vec3(0, 1, 0);
+            const glm::vec3 right = glm::normalize(glm::cross(axis, helper)) * (width * 0.5f);
+            const glm::vec3 up = glm::normalize(glm::cross(axis, right)) * (width * 0.5f);
+            // Narrow, fully 3D prism: unlike glLineWidth, thickness is portable
+            // across core OpenGL drivers.
+            const std::array<glm::vec3, 4> s = {
+                beam->start - right - up, beam->start + right - up,
+                beam->start + right + up, beam->start - right + up
+            };
+            const std::array<glm::vec3, 4> e = {
+                beam->end - right - up, beam->end + right - up,
+                beam->end + right + up, beam->end - right + up
+            };
+            std::vector<glm::vec3> vertices;
+            vertices.reserve(36);
+            auto quad = [&](const glm::vec3& a, const glm::vec3& b,
+                            const glm::vec3& c, const glm::vec3& d) {
+                vertices.insert(vertices.end(), {a, b, c, a, c, d});
+            };
+            for (int i = 0; i < 4; ++i) {
+                const int j = (i + 1) % 4;
+                quad(s[i], s[j], e[j], e[i]);
+            }
+            quad(s[3], s[2], s[1], s[0]);
+            quad(e[0], e[1], e[2], e[3]);
+            drawTriangles(vertices, glm::vec3(1.0f, 0.015f, 0.015f));
+        }
+    }
+    glBindVertexArray(0);
+}

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <vector>
 #include <glm/glm.hpp>
 
 struct GLFWwindow;
@@ -56,6 +57,13 @@ private:
     bool _adminKeyWasDown = false;
     bool _leftPrev = false;
     Camera _savedGameCamera;
+
+    // Third-person-only hitscan fire: short-lived beam, persistent marks.
+    bool _firePrev = false;
+    float _beamRemaining = 0.0f;
+    ShotBeam _shotBeam;
+    std::vector<ShotMark> _shotMarks;
+    void fireShot();
     glm::vec3 _dragOffset{0.0f};
 
     void setAdminMode(bool enabled);

@@ -209,6 +209,9 @@ bool App::init() {
     _leftPrev = false;
     _adminKeyWasDown = false;
     _savedGameCamera = _camera;
+    _firePrev = false;
+    _beamRemaining = 0.0f;
+    _shotMarks.clear();
 
     return true;
 }
@@ -299,6 +302,8 @@ void App::setAdminMode(bool enabled) {
     }
 
     _adminMode = enabled;
+    _beamRemaining = 0.0f; // No shooting effects in editor mode.
+    _firePrev = (glfwGetMouseButton(_window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS);
     _firstMouse = true;
     _renderer.setPrevCameraPos(_camera.pos);
 }
@@ -313,6 +318,7 @@ void App::frame() {
     ImGui::NewFrame();
 
     processInput();
+    _beamRemaining = std::max(0.0f, _beamRemaining - _deltaTime);
 
     if (!_adminMode) {
         _thirdPersonCamera.update(_camera, _player.position, _deltaTime);
@@ -358,7 +364,8 @@ void App::frame() {
         ImGui::TextUnformatted("WASD: camera | Q/E: subir/descer | F1: jogo");
     } else {
         ImGui::TextUnformatted("JOGO | WASD: mech | Shift: correr");
-        ImGui::TextUnformatted("Mouse: camera | Tab: cursor | F1: admin");
+        ImGui::TextUnformatted("Mouse: camera | Clique esquerdo: atirar");
+        ImGui::TextUnformatted("Tab: cursor | F1: admin");
         ImGui::Text("Pos: %.1f, %.1f, %.1f",
                     _player.position.x, _player.position.y, _player.position.z);
     }
@@ -487,9 +494,40 @@ void App::frame() {
     if (_deltaTime > 0.0f) updatePhysics(_scene, _deltaTime);
     syncMech();
 
+    // Edge-triggered left click, ignored while operating ImGui / admin mode.
+    const bool fireDown =
+        glfwGetMouseButton(_window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+    if (!_adminMode && _cameraActive && fireDown && !_firePrev &&
+        !ImGui::GetIO().WantCaptureMouse) {
+        fireShot();
+    }
+    _firePrev = fireDown;
+
+    // Center-screen reticle exists only in player third-person mode.
+    if (!_adminMode) {
+        const ImVec2 display = ImGui::GetIO().DisplaySize;
+        const ImVec2 center(display.x * 0.5f, display.y * 0.5f);
+        ImDrawList* overlay = ImGui::GetForegroundDrawList();
+        const ImU32 dark = IM_COL32(12, 12, 12, 230);
+        const ImU32 red = IM_COL32(255, 60, 60, 245);
+        for (int i = 0; i < 4; ++i) {
+            const ImVec2 dir = i == 0 ? ImVec2(1, 0) : i == 1 ? ImVec2(-1, 0) :
+                               i == 2 ? ImVec2(0, 1) : ImVec2(0, -1);
+            const ImVec2 p0(center.x + dir.x * 6.0f, center.y + dir.y * 6.0f);
+            const ImVec2 p1(center.x + dir.x * 13.0f, center.y + dir.y * 13.0f);
+            overlay->AddLine(p0, p1, dark, 4.0f);
+            overlay->AddLine(p0, p1, red, 2.0f);
+        }
+        overlay->AddCircleFilled(center, 1.8f, red);
+    }
+
     glClearColor(0.10f, 0.10f, 0.10f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     _renderer.draw(_scene, _camera);
+    if (!_adminMode) {
+        _renderer.drawShots(_scene, _camera, _shotMarks,
+                            _beamRemaining > 0.0f ? &_shotBeam : nullptr);
+    }
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     glfwSwapBuffers(_window);
@@ -597,4 +635,54 @@ void App::processInput() {
         glfwGetKey(_window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
         glfwGetKey(_window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
     _player.update(input, _camera, _deltaTime);
+}
+
+
+void App::fireShot() {
+    // The reticle represents the exact center ray of Renderer::draw().
+    constexpr float maxRange = 90.0f;
+    constexpr float beamDuration = 0.14f;
+    const glm::vec3 aimDirection = glm::normalize(_camera.front);
+    const Ray cameraRay{_camera.pos, aimDirection};
+    const RayHit aimedAt = raycastShapes(_scene, cameraRay, maxRange, 100);
+    const glm::vec3 aimPoint = aimedAt.hit()
+        ? aimedAt.point : cameraRay.o + cameraRay.d * maxRange;
+
+    // Offset barrel to the shoulder's right; no accidental self-hit on mech.
+    const glm::vec3 horizontal(aimDirection.x, 0.0f, aimDirection.z);
+    const glm::vec3 horizontalForward = glm::dot(horizontal, horizontal) > 1.0e-6f
+        ? glm::normalize(horizontal) : glm::vec3(0.0f, 0.0f, -1.0f);
+    const glm::vec3 right = glm::normalize(glm::cross(horizontalForward, _camera.up));
+    const glm::vec3 muzzle = _player.position + glm::vec3(0.0f, 0.35f, 0.0f)
+        + right * 1.0f + horizontalForward * 0.55f;
+    const glm::vec3 offset = aimPoint - muzzle;
+    if (glm::dot(offset, offset) < 0.0001f) return;
+
+    const float travel = glm::length(offset);
+    const Ray shotRay{muzzle, offset / travel};
+    const RayHit hit = raycastShapes(_scene, shotRay,
+                                     std::min(maxRange, travel + 0.02f), 100);
+    _shotBeam = {muzzle, hit.hit() ? hit.point : aimPoint};
+    _beamRemaining = beamDuration;
+
+    if (!hit.hit()) return;
+    const std::vector<Shape>* shapes = nullptr;
+    if (hit.selection.type == ShapeType::Rect) shapes = &_scene.rectsRef();
+    if (hit.selection.type == ShapeType::Pyramid) shapes = &_scene.pyramidsRef();
+    if (hit.selection.type == ShapeType::Sphere) shapes = &_scene.spheresRef();
+    if (!shapes || hit.selection.index < 0 ||
+        static_cast<std::size_t>(hit.selection.index) >= shapes->size()) return;
+
+    const Shape& target = (*shapes)[static_cast<std::size_t>(hit.selection.index)];
+    const glm::quat inverseRotation = glm::inverse(target.rot);
+    ShotMark mark;
+    mark.type = hit.selection.type;
+    mark.shapeIndex = hit.selection.index;
+    mark.shapeId = target.id;
+    mark.localPoint = inverseRotation * (hit.point - target.pos);
+    mark.localNormal = inverseRotation * hit.normal;
+    // Bound memory even after a long play session. Marks persist until replaced.
+    constexpr std::size_t maxMarks = 256;
+    if (_shotMarks.size() >= maxMarks) _shotMarks.erase(_shotMarks.begin());
+    _shotMarks.push_back(mark);
 }
