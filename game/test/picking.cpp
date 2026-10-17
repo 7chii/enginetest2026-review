@@ -208,7 +208,45 @@ RayHit raycastShapes(const Scene& scene, const Ray& ray,
             if (shape.id == ignoredShapeId) continue;
             SurfaceHit candidate;
             bool intersects = false;
-            switch (type) {
+            // Raycast against the carved mesh; don't hit invisible original
+            // triangles in its cavity. Mesh vertices are in rotated local units.
+            if (shape.damage.active()) {
+                const glm::quat inverseRotation = glm::inverse(shape.rot);
+                const Ray local{inverseRotation * (ray.o - shape.pos),
+                                inverseRotation * ray.d};
+                float closestMesh = nearest;
+                // BVH ray traversal: avoid intersecting every damaged triangle.
+                std::vector<int> triangleCandidates;
+                if(!shape.damage.bvh.empty()) {
+                    std::vector<int> stack{0};
+                    while(!stack.empty()) {
+                        const int index=stack.back();stack.pop_back();
+                        const auto& node=shape.damage.bvh[index];
+                        float entry=0.0f;
+                        if(!rayAABB(local,node.min,node.max,entry) || entry>closestMesh)continue;
+                        if(node.left>=0) {
+                            stack.push_back(node.left);
+                            stack.push_back(node.right);
+                        }else for(int i=0;i<node.count;++i)
+                            triangleCandidates.push_back(shape.damage.triangleOrder[node.first+i]);
+                    }
+                }else for(int i=0;i<static_cast<int>(shape.damage.triangles.size()/3);++i)
+                    triangleCandidates.push_back(i);
+                for(int triangle:triangleCandidates) {
+                    const std::size_t tri=static_cast<std::size_t>(triangle)*3;
+                    SurfaceHit surface;
+                    if (rayTriangle(local, shape.damage.triangles[tri],
+                                    shape.damage.triangles[tri + 1],
+                                    shape.damage.triangles[tri + 2], surface) &&
+                        surface.distance < closestMesh &&
+                        surface.distance >= 0.001f) {
+                        closestMesh = surface.distance;
+                        candidate = surface;
+                        intersects = true;
+                    }
+                }
+                if (intersects) candidate.normal = glm::normalize(shape.rot * candidate.normal);
+            } else switch (type) {
                 case ShapeType::Rect:
                     intersects = rayBoxSurface(ray, shape, candidate);
                     break;

@@ -1,5 +1,7 @@
 #pragma once
 #include <glm/glm.hpp>
+#include <vector>
+#include <cstdint>
 #include <glm/gtc/quaternion.hpp>
 #include "geometry.h"
 
@@ -15,9 +17,39 @@ enum class ShapeType {
 
 
 
+// Each hit subtracts a tessellated hemispherical cavity from the original mesh.
+struct CavityCut {
+    glm::vec3 point{0.0f};
+    glm::vec3 normal{0.0f,1.0f,0.0f};
+    float radius=0.33f;
+    float depth=0.33f;
+    float outside=0.08f;
+};
+struct MeshTriangleBounds {
+    glm::vec3 min{0.0f};
+    glm::vec3 max{0.0f};
+};
+struct MeshBVHNode {
+    glm::vec3 min{0.0f};
+    glm::vec3 max{0.0f};
+    int left=-1,right=-1;
+    int first=0,count=0; // leaf range in triangleOrder
+};
+struct MeshDamage {
+    std::vector<CavityCut> cuts;
+    std::vector<glm::vec3> triangles; // unscaled local-space triangle soup
+    std::vector<MeshTriangleBounds> triangleBounds;
+    std::vector<int> triangleOrder;
+    std::vector<MeshBVHNode> bvh;
+    std::uint32_t revision=0;
+    bool active() const { return !cuts.empty(); }
+};
+
 struct Shape {
 
     ShapeType type = ShapeType::None;
+    MeshDamage damage;
+    bool isShotFragment = false;
     int id = -1;
     bool geometryDirty = true;
 

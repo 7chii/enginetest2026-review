@@ -30,6 +30,16 @@ static std::vector<std::string> splitTokens(const std::string& s) {
     return out;
 }
 
+// Keep IDs unique across all three scene containers. GPU damage buffers and
+// shot marks are keyed by this identity, not by the index of one container.
+static int allocateShapeId(const Scene& scene) {
+    int id=-1000; // reserved negative IDs: never overlap positive shot fragments
+    for(const Shape& s:scene.rectsRef()) if(s.id<=id) id=s.id-1;
+    for(const Shape& s:scene.pyramidsRef()) if(s.id<=id) id=s.id-1;
+    for(const Shape& s:scene.spheresRef()) if(s.id<=id) id=s.id-1;
+    return id;
+}
+
 static void processCommand(Scene& scene, const std::string& cmd) {
     auto tok = splitTokens(cmd);
     if (tok.empty()) return;
@@ -43,7 +53,7 @@ static void processCommand(Scene& scene, const std::string& cmd) {
         float m = extractMassFromTokens(tok, 1.0f);
         Shape s; s.pos = glm::vec3(x, y, z); s.scale = glm::vec3(1.0f); s.mass = m;
         setupPyramidShape(s);
-        s.id = (int)scene.pyramidsRef().size();
+        s.id = allocateShapeId(scene);
         s.inertia = computeLocalInertiaTensor(s);
         s.invInertia = glm::inverse(s.inertia);
         pyramids.push_back(s);
@@ -54,7 +64,7 @@ static void processCommand(Scene& scene, const std::string& cmd) {
         float m = extractMassFromTokens(tok, 1.0f);
         Shape s; s.pos = glm::vec3(x, y, z); s.scale = glm::vec3(1.0f); s.mass = m;
         setupSphereShape(s, 1.0f);
-        s.id = (int)scene.spheresRef().size();
+        s.id = allocateShapeId(scene);
         s.inertia = computeLocalInertiaTensor(s);
         s.invInertia = glm::inverse(s.inertia);
         spheres.push_back(s);
@@ -69,7 +79,7 @@ static void processCommand(Scene& scene, const std::string& cmd) {
             float m = extractMassFromTokens(tok, 1.0f);
             Shape s; s.pos = glm::vec3(x, y, z); s.scale = glm::vec3(dx, dy, dz); s.mass = m;
             setupRectShape(s);
-            s.id = (int)scene.rectsRef().size();
+            s.id = allocateShapeId(scene);
             s.inertia = computeLocalInertiaTensor(s);
             s.invInertia = glm::inverse(s.inertia);
             rects.push_back(s);
