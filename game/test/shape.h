@@ -17,12 +17,12 @@ enum class ShapeType {
 
 
 
-// Each hit subtracts a 16-sided polygonal drill from the original mesh.
+// Each hit subtracts a tessellated hemispherical cavity from the original mesh.
 struct CavityCut {
     glm::vec3 point{0.0f};
     glm::vec3 normal{0.0f,1.0f,0.0f};
     float radius=0.33f;
-    float depth=0.55f;
+    float depth=0.33f;
     float outside=0.08f;
 };
 struct MeshTriangleBounds {

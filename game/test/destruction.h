@@ -1,5 +1,5 @@
 #pragma once
-// Polygonal local CSG (solid minus oriented polygonal drill).
+// Polygonal local CSG (solid minus oriented hemispherical cutter).
 // No voxel conversion: original box, pyramid, or sphere triangles are kept
 // wherever they do not intersect the cutter. Cap and wall polygons are clipped
 // against the original convex mesh and existing cuts.
@@ -142,46 +142,100 @@ inline void outsideConvex(const Polygon& input,const std::vector<Plane>& planes,
         remaining=clipHalfspace(remaining,plane,true);
     }
 }
+// Tessellate a convex hemispherical cutter once per carve/query. Its opening
+// is a circular mouth on the impact plane, and the curved cup extends inward.
+// The short outward collar is intentionally OUTSIDE the shape: it avoids a
+// coplanar cutter cap on the original surface (which would seal the hole).
+//
+// The same cutter triangles generate BOTH the CSG planes and the triangles
+// placed on the inner walls. This keeps rendering, raycasts and collision
+// clipping consistent even when two hits overlap.
+inline std::vector<glm::vec3> cutterOutwardTriangles(const CavityCut& cut) {
+    constexpr int sectors = 20;
+    constexpr int curvedBands = 6;
+    const glm::vec3 n = glm::normalize(cut.normal);
+    const glm::vec3 u = glm::normalize(glm::cross(n,
+        std::abs(n.y) < 0.95f ? glm::vec3(0,1,0) : glm::vec3(1,0,0)));
+    const glm::vec3 v = glm::cross(n,u);
+    const glm::vec3 interior = cut.point - n * (cut.depth * 0.25f);
+    std::vector<glm::vec3> triangles;
+    triangles.reserve(static_cast<std::size_t>(sectors) * (curvedBands * 6 + 12));
+
+    // Winding must be outward from the removed volume. The final cavity
+    // surface uses the reverse winding to point out of the remaining solid.
+    auto addOutward = [&](glm::vec3 a, glm::vec3 b, glm::vec3 c) {
+        if (glm::dot(glm::cross(b-a,c-a),(a+b+c)/3.0f-interior) < 0.0f)
+            std::swap(b,c);
+        appendTriangle(triangles,a,b,c);
+    };
+    auto pointOnRing = [&](int band, int sector) -> glm::vec3 {
+        const float theta = 0.5f * glm::pi<float>() *
+                            static_cast<float>(band) / curvedBands;
+        const float phi = 2.0f * glm::pi<float>() *
+                          static_cast<float>(sector) / sectors;
+        const glm::vec3 radial = u * std::cos(phi) + v * std::sin(phi);
+        // Equal radius/depth is a true hemisphere. Explicit unequal values
+        // make a half-ellipsoid without changing the CSG algorithm.
+        return cut.point + radial * (cut.radius * std::cos(theta))
+                         - n * (cut.depth * std::sin(theta));
+    };
+    const glm::vec3 tip = cut.point - n * cut.depth;
+    const glm::vec3 capCenter = cut.point + n * cut.outside;
+    for (int sector=0; sector<sectors; ++sector) {
+        const int next = (sector+1)%sectors;
+        const glm::vec3 a = pointOnRing(0,sector);
+        const glm::vec3 b = pointOnRing(0,next);
+        const glm::vec3 frontA = a + n * cut.outside;
+        const glm::vec3 frontB = b + n * cut.outside;
+        // Collar and front cap close the cutter *outside* the parent shape.
+        addOutward(frontA,frontB,b);
+        addOutward(frontA,b,a);
+        addOutward(capCenter,frontA,frontB);
+        for (int band=0;band<curvedBands-1;++band) {
+            const glm::vec3 upperA=pointOnRing(band,sector);
+            const glm::vec3 upperB=pointOnRing(band,next);
+            const glm::vec3 lowerA=pointOnRing(band+1,sector);
+            const glm::vec3 lowerB=pointOnRing(band+1,next);
+            addOutward(upperA,upperB,lowerB);
+            addOutward(upperA,lowerB,lowerA);
+        }
+        addOutward(pointOnRing(curvedBands-1,sector),
+                   pointOnRing(curvedBands-1,next),tip);
+    }
+    return triangles;
+}
 inline std::vector<Plane> cutterPlanes(const CavityCut& cut) {
+    // Cutter faces are emitted in adjacent, coplanar triangle pairs. Keep
+    // one plane per facet instead of O(facets^2) duplicate comparisons:
+    // physics also calls this for collision clipping while objects move.
+    const auto faces = cutterOutwardTriangles(cut);
     std::vector<Plane> planes;
-    const glm::vec3 n=glm::normalize(cut.normal);
-    planes.push_back({n,glm::dot(n,cut.point+n*cut.outside)});
-    planes.push_back({-n,glm::dot(-n,cut.point-n*cut.depth)});
-    const glm::vec3 u=glm::normalize(glm::cross(n,std::abs(n.y)<0.95f
-                                     ? glm::vec3(0,1,0):glm::vec3(1,0,0)));
-    const glm::vec3 v=glm::cross(n,u);
-    constexpr int sides=16;
-    for(int i=0;i<sides;++i){
-        const float a=2.0f*glm::pi<float>()*i/sides;
-        const float b=2.0f*glm::pi<float>()*(i+1)/sides;
-        const glm::vec3 ra=u*std::cos(a)+v*std::sin(a);
-        const glm::vec3 rb=u*std::cos(b)+v*std::sin(b);
-        const glm::vec3 radial=glm::normalize(ra+rb);
-        planes.push_back({radial,glm::dot(radial,cut.point+ra*cut.radius)});
+    planes.reserve(144);
+    const glm::vec3 axis=glm::normalize(cut.normal);
+    const float frontD=glm::dot(axis,cut.point+axis*cut.outside);
+    bool frontAdded=false;
+    for(std::size_t i=0;i+2<faces.size();i+=3) {
+        const glm::vec3& a=faces[i];
+        glm::vec3 n=glm::cross(faces[i+1]-a,faces[i+2]-a);
+        const float length=glm::length(n);
+        if(length<1.e-7f) continue;
+        n/=length;
+        const float d=glm::dot(n,a);
+        if(glm::dot(n,axis)>0.99999f && std::abs(d-frontD)<0.00005f) {
+            if(frontAdded) continue;
+            frontAdded=true;
+        }
+        if(!planes.empty() && glm::dot(planes.back().n,n)>0.99999f &&
+           std::abs(planes.back().d-d)<0.00005f) continue;
+        planes.push_back({n,d});
     }
     return planes;
 }
 inline std::vector<glm::vec3> cutterTriangles(const CavityCut& cut) {
-    std::vector<glm::vec3> result;
-    const glm::vec3 n=glm::normalize(cut.normal);
-    const glm::vec3 u=glm::normalize(glm::cross(n,std::abs(n.y)<0.95f
-                                     ? glm::vec3(0,1,0):glm::vec3(1,0,0)));
-    const glm::vec3 v=glm::cross(n,u);
-    constexpr int sides=16;
-    const glm::vec3 front=cut.point+n*cut.outside;
-    const glm::vec3 back=cut.point-n*cut.depth;
-    for(int i=0;i<sides;++i) {
-        const float a=2.0f*glm::pi<float>()*i/sides;
-        const float b=2.0f*glm::pi<float>()*(i+1)/sides;
-        const glm::vec3 ra=(u*std::cos(a)+v*std::sin(a))*cut.radius;
-        const glm::vec3 rb=(u*std::cos(b)+v*std::sin(b))*cut.radius;
-        // Reverse cutter face normals: these are outward from remaining solid.
-        appendTriangle(result,front+ra,front+rb,back+rb);
-        appendTriangle(result,front+ra,back+rb,back+ra);
-        appendTriangle(result,back,back+ra,back+rb); // inward into removed channel
-        appendTriangle(result,front,front+rb,front+ra);
-    }
-    return result;
+    std::vector<glm::vec3> triangles = cutterOutwardTriangles(cut);
+    for (std::size_t i=0; i+2<triangles.size(); i+=3)
+        std::swap(triangles[i+1],triangles[i+2]);
+    return triangles;
 }
 // Build a per-shape local-space BVH after the CPU mesh changes. The tree
 // is rebuilt only on a shot, never once per physics frame or raycast.
@@ -227,9 +281,13 @@ inline void buildBVH(MeshDamage& mesh) {
     build(0,count);
 }
 
-inline bool insideCut(const CavityCut& cut,const glm::vec3& p) {
-    for(const Plane& plane:cutterPlanes(cut)) if(glm::dot(plane.n,p)>plane.d+1e-5f) return false;
+inline bool insidePlanes(const std::vector<Plane>& planes,const glm::vec3& p) {
+    for(const Plane& plane:planes)
+        if(glm::dot(plane.n,p)>plane.d+1e-5f) return false;
     return true;
+}
+inline bool insideCut(const CavityCut& cut,const glm::vec3& p) {
+    return insidePlanes(cutterPlanes(cut),p);
 }
 inline bool insideOriginal(const std::vector<Plane>& planes,const glm::vec3& p){
     for(const Plane& plane:planes) if(glm::dot(plane.n,p)>plane.d+1e-4f) return false;
@@ -241,7 +299,7 @@ struct CarveResult {
 };
 inline CarveResult carve(Shape& shape, const glm::vec3& worldPoint,
                          const glm::vec3& worldNormal,float radius=0.33f,
-                         float depth=0.55f) {
+                         float depth=-1.0f) {
     if(shape.isShotFragment || shape.id==100) return {};
     if(shape.type!=ShapeType::Rect && shape.type!=ShapeType::Pyramid &&
        shape.type!=ShapeType::Sphere) return {};
@@ -249,11 +307,20 @@ inline CarveResult carve(Shape& shape, const glm::vec3& worldPoint,
     CavityCut cut;
     cut.point=inv*(worldPoint-shape.pos);
     cut.normal=glm::normalize(inv*worldNormal);
-    cut.radius=radius;cut.depth=depth;
+    if (!std::isfinite(radius) || radius <= 0.0f ||
+        (depth != -1.0f && (!std::isfinite(depth) || depth <= 0.0f))) return {};
+    cut.radius=radius;
+    cut.depth=depth > 0.0f ? depth : radius;
     const auto original=originalTriangles(shape);
     const auto basePlanes=convexPlanes(original);
     if(original.empty() || basePlanes.empty()) return {};
     const auto planes=cutterPlanes(cut);
+    // Reuse old clipping planes across every new bowl triangle and sample.
+    // Generating them per triangle would be costly with a curved cutter.
+    std::vector<std::vector<Plane>> oldCutPlanes;
+    oldCutPlanes.reserve(shape.damage.cuts.size());
+    for(const CavityCut& old:shape.damage.cuts)
+        oldCutPlanes.push_back(cutterPlanes(old));
 
     CarveResult result;
     const glm::vec3 n=cut.normal;
@@ -264,19 +331,19 @@ inline CarveResult carve(Shape& shape, const glm::vec3& worldPoint,
     for(int j=0;j<8;++j) for(int k=0;k<3;++k) {
         const float a=2.0f*glm::pi<float>()*(j+0.5f)/8.0f;
         const float r=radius*(k==0?0.2f:(k==1?0.52f:0.77f));
-        const glm::vec3 sample=cut.point-n*(depth*0.36f)+
+        const glm::vec3 sample=cut.point-n*(cut.depth*0.36f)+
                     r*(std::cos(a)*u+std::sin(a)*v);
         if(!insideOriginal(basePlanes,sample)) continue;
         bool previouslyRemoved=false;
-        for(const auto& old:shape.damage.cuts) if(insideCut(old,sample)){previouslyRemoved=true;break;}
+        for(const auto& oldPlanes:oldCutPlanes) if(insidePlanes(oldPlanes,sample)){previouslyRemoved=true;break;}
         if(!previouslyRemoved) result.removedLocalCenters.push_back(sample);
     }
     // Surface clipping also covers very thin shapes where depth sample misses.
     if(result.removedLocalCenters.empty()) {
-        const glm::vec3 sample=cut.point-n*std::min(depth*0.14f,0.02f);
+        const glm::vec3 sample=cut.point-n*std::min(cut.depth*0.14f,0.02f);
         if(insideOriginal(basePlanes,sample)) {
             bool old=false;
-            for(const auto& prev:shape.damage.cuts) if(insideCut(prev,sample)) old=true;
+            for(const auto& oldPlanes:oldCutPlanes) if(insidePlanes(oldPlanes,sample)) old=true;
             if(!old) result.removedLocalCenters.push_back(sample);
         }
     }
@@ -295,9 +362,8 @@ inline CarveResult carve(Shape& shape, const glm::vec3& worldPoint,
         Polygon p=insideConvex({cutterMesh[i],cutterMesh[i+1],cutterMesh[i+2]},basePlanes);
         if(p.size()<3) continue;
         std::vector<Polygon> parts{std::move(p)};
-        for(const CavityCut& old:shape.damage.cuts) {
+        for(const auto& oldPlanes:oldCutPlanes) {
             std::vector<glm::vec3> outside;
-            const auto oldPlanes=cutterPlanes(old);
             for(const Polygon& fragment:parts) outsideConvex(fragment,oldPlanes,outside);
             parts.clear();
             for(std::size_t j=0;j+2<outside.size();j+=3)
