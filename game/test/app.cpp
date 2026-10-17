@@ -8,6 +8,7 @@
 #include <cmath>
 #include <iostream>
 #include <vector>
+#include <utility>
 
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
@@ -22,6 +23,7 @@
 #include "picking.h"
 #include "scene.h"
 #include "shape.h"
+#include "destruction.h"
 
 // Mantido porque os modulos de fisica/scene podem consultar esta lista.
 std::vector<Shape*> gShapes;
@@ -364,7 +366,7 @@ void App::frame() {
         ImGui::TextUnformatted("WASD: camera | Q/E: subir/descer | F1: jogo");
     } else {
         ImGui::TextUnformatted("JOGO | WASD: mech | Shift: correr");
-        ImGui::TextUnformatted("Mouse: camera | Clique esquerdo: atirar");
+        ImGui::TextUnformatted("Mouse: camera | Clique esquerdo: atirar / fragmentar");
         ImGui::TextUnformatted("Tab: cursor | F1: admin");
         ImGui::Text("Pos: %.1f, %.1f, %.1f",
                     _player.position.x, _player.position.y, _player.position.z);
@@ -666,23 +668,102 @@ void App::fireShot() {
     _beamRemaining = beamDuration;
 
     if (!hit.hit()) return;
-    const std::vector<Shape>* shapes = nullptr;
+    std::vector<Shape>* shapes = nullptr;
     if (hit.selection.type == ShapeType::Rect) shapes = &_scene.rectsRef();
     if (hit.selection.type == ShapeType::Pyramid) shapes = &_scene.pyramidsRef();
     if (hit.selection.type == ShapeType::Sphere) shapes = &_scene.spheresRef();
     if (!shapes || hit.selection.index < 0 ||
         static_cast<std::size_t>(hit.selection.index) >= shapes->size()) return;
 
-    const Shape& target = (*shapes)[static_cast<std::size_t>(hit.selection.index)];
-    const glm::quat inverseRotation = glm::inverse(target.rot);
-    ShotMark mark;
-    mark.type = hit.selection.type;
-    mark.shapeIndex = hit.selection.index;
-    mark.shapeId = target.id;
-    mark.localPoint = inverseRotation * (hit.point - target.pos);
-    mark.localNormal = inverseRotation * hit.normal;
-    // Bound memory even after a long play session. Marks persist until replaced.
-    constexpr std::size_t maxMarks = 256;
-    if (_shotMarks.size() >= maxMarks) _shotMarks.erase(_shotMarks.begin());
-    _shotMarks.push_back(mark);
+    Shape& target = (*shapes)[static_cast<std::size_t>(hit.selection.index)];
+    // Correct triangle winding: the visible face must point towards the shooter.
+    const glm::vec3 normal = glm::normalize(
+        glm::dot(hit.normal, shotRay.d) > 0.0f ? -hit.normal : hit.normal);
+    const glm::vec3 inheritedVelocity = target.vel;
+    // Impulse affects the struck body, including objects that had gone to sleep.
+    if (!target.isStatic && !target.isDragging) {
+        const glm::vec3 impulse = shotRay.d * 3.6f;
+        target.vel += impulse * getInvMass(target);
+        target.angularVel += glm::cross(hit.point - target.pos, impulse) * 0.32f;
+        target.isSleeping = false;
+        target.sleepTimer = 0.0f;
+        target.isGrounded = false;
+        target.supportIsStable = false;
+        target.geometryDirty = true;
+    }
+    // Debris already represents a detached piece. Hitting it pushes it further,
+    // but does not recursively explode it into hundreds of smaller bodies.
+    if (target.isShotFragment) return;
+    const Destruction::CarveResult cut = Destruction::carve(target, hit.point, normal);
+    if (!cut.changed()) return;
+    const glm::quat sourceRotation = target.rot;
+    const glm::vec3 sourcePosition = target.pos;
+
+    // Use the project's real pyramid physics for small four-sided pyramids.
+    // Eject debris toward the outer surface. The damaged parent now uses its
+    // actual cavity triangles for contacts (not the old convex collider).
+    constexpr int piecesPerShot = 8;
+    constexpr std::size_t maxLivePieces = 32;
+    static int nextFragmentId = 2000000;
+    auto& debrisList = _scene.pyramidsRef();
+    std::size_t livePieces = 0;
+    for (const Shape& s : debrisList) if (s.isShotFragment) ++livePieces;
+    while (livePieces + piecesPerShot > maxLivePieces) {
+        auto it = std::find_if(debrisList.begin(), debrisList.end(),
+            [](const Shape& s) { return s.isShotFragment; });
+        if (it == debrisList.end()) break;
+        const std::size_t erasedIndex = static_cast<std::size_t>(it - debrisList.begin());
+        debrisList.erase(it);
+        // Selection is only used in the editor, but keep its index valid.
+        Selection& selected = _scene.selectionRef();
+        if (selected.type == ShapeType::Pyramid) {
+            if (selected.index == static_cast<int>(erasedIndex)) selected = Selection{};
+            else if (selected.index > static_cast<int>(erasedIndex)) --selected.index;
+        }
+        --livePieces;
+    }
+
+    const glm::vec3 helper = std::abs(normal.y) < 0.92f
+        ? glm::vec3(0.0f, 1.0f, 0.0f) : glm::vec3(1.0f, 0.0f, 0.0f);
+    const glm::vec3 axisU = glm::normalize(glm::cross(normal, helper));
+    const glm::vec3 axisV = glm::normalize(glm::cross(normal, axisU));
+    constexpr float goldenAngle = 2.399963229728653f;
+    for (int i = 0; i < piecesPerShot; ++i) {
+        const float f = static_cast<float>(i + 1) / piecesPerShot;
+        const float angle = i * goldenAngle;
+        const glm::vec3 radial = std::cos(angle) * axisU + std::sin(angle) * axisV;
+        const std::size_t sample = std::min(
+            cut.removedLocalCenters.size() - 1,
+            static_cast<std::size_t>(f * (cut.removedLocalCenters.size() - 1)));
+        const glm::vec3 cutLocal = cut.removedLocalCenters[sample];
+        const glm::vec3 removedWorldPoint = sourcePosition + sourceRotation * cutLocal;
+        const float depthBelowSurface = std::max(
+            0.0f, glm::dot(hit.point - removedWorldPoint, normal));
+        Shape piece;
+        piece.type = ShapeType::Pyramid;
+        piece.isShotFragment = true;
+        piece.id = nextFragmentId++;
+        piece.scale = glm::vec3(0.13f + 0.045f * (i % 3),
+                                0.14f + 0.025f * (i % 4),
+                                0.13f + 0.035f * ((i + 1) % 3));
+        // Eject the fragment from the channel mouth, preventing initial overlap.
+        piece.pos = removedWorldPoint + normal *
+            (depthBelowSurface + 0.27f + 0.055f * (i % 3));
+        piece.rot = glm::angleAxis(angle, glm::normalize(normal + axisU * 0.2f));
+        piece.mass = 0.065f;
+        piece.useGravity = true;
+        piece.isStatic = false;
+        piece.isSleeping = false;
+        piece.vel = inheritedVelocity + normal * (4.0f + 2.5f * f) +
+                    radial * (1.8f + 2.0f * f) + shotRay.d * 0.6f;
+        piece.angularVel = axisU * (5.0f + i % 4) +
+                           axisV * (3.0f + (i * 3) % 5);
+        piece.requestedFaceCount = 5;
+        piece.requestedVertexCount = 5;
+        setupPyramidShape(piece);
+        piece.inertia = computeLocalInertiaTensor(piece);
+        piece.invInertia = glm::inverse(piece.inertia);
+        piece.geometryDirty = true;
+        debrisList.push_back(std::move(piece));
+    }
 }

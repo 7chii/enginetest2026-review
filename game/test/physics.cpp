@@ -1,4 +1,5 @@
-﻿#include "physics.h"
+#include "physics.h"
+#include "destruction.h"
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/gtx/norm.hpp>
 #include <glm/glm.hpp>
@@ -9,6 +10,7 @@
 #include <vector>
 #include <cfloat>
 #include <array>
+#include <utility>
 #include <algorithm>
 #include <limits>
 #include <glm/gtc/matrix_transform.hpp>
@@ -143,7 +145,7 @@ static AABB computeAABB(const Shape& s)
 {
     if (s.type == ShapeType::Sphere)
     {
-        float r = s.scale.x * s.radius;
+        const float r = s.radius * std::max({s.scale.x,s.scale.y,s.scale.z});
         return { s.pos - glm::vec3(r), s.pos + glm::vec3(r) };
     }
 
@@ -164,9 +166,10 @@ static AABB computeAABB(const Shape& s)
 
 static bool aabbOverlap(const AABB& a, const AABB& b)
 {
-    if (a.max.x < b.min.x || a.min.x > b.max.x) return false;
-    if (a.max.y < b.min.y || a.min.y > b.max.y) return false;
-    if (a.max.z < b.min.z || a.min.z > b.max.z) return false;
+    constexpr float contactSkin = 0.012f;
+    if (a.max.x + contactSkin < b.min.x || a.min.x - contactSkin > b.max.x) return false;
+    if (a.max.y + contactSkin < b.min.y || a.min.y - contactSkin > b.max.y) return false;
+    if (a.max.z + contactSkin < b.min.z || a.min.z - contactSkin > b.max.z) return false;
     return true;
 }
 static void computePyramidFaces(Shape& p)
@@ -593,17 +596,22 @@ static void handleGroundContact(Shape& s, float dt)
         for (int i = 0; i < s.geometry.vertexCount; ++i)
             minY = std::min(minY, s.geometry.vertices[i].y);
 
-    s.isGrounded = minY <= 0.013f;
+    const bool touchesGround = minY <= 0.013f;
+    // Keep verified object-on-object contacts found earlier in this substep.
+    // Clearing the flags during each solver iteration made a resting body
+    // randomly lose support on the final pass as positional correction reached
+    // the 12 mm skin boundary, resetting its sleep timer every frame.
+    s.isGrounded = s.isGrounded || touchesGround;
     // Non-spherical objects require an actual face, rather than an unstable
     // single vertex / edge, before they may go to sleep on the floor.
     int nearCount = 0;
     if (s.type != ShapeType::Sphere)
         for (int i = 0; i < s.geometry.vertexCount; ++i)
             if (s.geometry.vertices[i].y <= minY + 0.012f) ++nearCount;
-    s.supportIsStable = s.isGrounded &&
-        (s.type == ShapeType::Sphere || nearCount >= 3);
+    s.supportIsStable = s.supportIsStable ||
+        (touchesGround && (s.type == ShapeType::Sphere || nearCount >= 3));
 
-    if (s.isGrounded && !s.isSleeping)
+    if (touchesGround && !s.isSleeping)
         solveGroundContact(s, glm::vec3(0.0f, minY, 0.0f), dt);
 }
 
@@ -1403,6 +1411,441 @@ static glm::vec3 closestPointTriangle(const glm::vec3& p,
     return a + ab*(vb*denom) + ac*(vc*denom);
 }
 
+
+// Concave contact: collide other bodies against the actual modified triangle
+// surface rather than the parent object's convex hull. Triangle normals point
+// away from the remaining solid (including into carved cavities).
+// Broad phase uses local-space cached triangle bounds; narrow phase uses
+// sphere-to-triangle and convex feature points-to-triangle tests.
+static void solveMeshPoint(Shape& mesh, Shape& body,
+                           const glm::vec3& point,glm::vec3 normal,float penetration,
+                           float correctionWeight = 1.0f) {
+    if (penetration <= 0.0f || glm::length2(normal)<1e-10f) return;
+    normal=glm::normalize(normal); // points from mesh into available space
+    const glm::vec3 relative=body.vel-mesh.vel;
+    // A shallow, persistent CSG overlap is not a new impact. Waking from
+    // penetration alone caused every previously sleeping stack to jitter.
+    // Wake on substantial RELATIVE motion instead; loss of support is handled
+    // at the end of the substep by updateSleepState().
+    const float closing=glm::dot(relative,normal);
+    if (closing < -0.26f || glm::length2(relative)>0.35f*0.35f) {
+        if (body.isSleeping && !body.isStatic && !body.isDragging) wake(body);
+        if (mesh.isSleeping && !mesh.isStatic && !mesh.isDragging) wake(mesh);
+    }
+    const float im=mesh.isSleeping ? 0.0f:getInvMass(mesh);
+    const float ib=body.isSleeping ? 0.0f:getInvMass(body);
+    if(im+ib<1e-9f) return;
+    const glm::mat3 I0=mesh.isSleeping ? glm::mat3(0.0f):computeWorldInvInertia(mesh);
+    const glm::mat3 I1=body.isSleeping ? glm::mat3(0.0f):computeWorldInvInertia(body);
+    constexpr float slop=0.002f;
+    const float correction=std::min(0.045f,
+        0.38f*std::max(0.0f,penetration-slop)/(im+ib)) * correctionWeight;
+    if(im>0){mesh.pos-=normal*correction*im;mesh.geometryDirty=true;}
+    if(ib>0){body.pos+=normal*correction*ib;body.geometryDirty=true;}
+    const glm::vec3 r0=point-mesh.pos, r1=point-body.pos;
+    glm::vec3 v0=mesh.vel+glm::cross(mesh.angularVel,r0);
+    glm::vec3 v1=body.vel+glm::cross(body.angularVel,r1);
+    glm::vec3 rv=v1-v0;
+    const float vn=glm::dot(rv,normal);
+    if(vn>=0.0f) return;
+    const glm::vec3 a=glm::cross(r0,normal), b=glm::cross(r1,normal);
+    const float denom=im+ib+glm::dot(I0*a,a)+glm::dot(I1*b,b);
+    if(denom<1e-9f) return;
+    const float jn=-(vn)*(vn<-2.0f?1.025f:1.0f)/denom;
+    const glm::vec3 impulse=normal*jn;
+    mesh.vel-=impulse*im;body.vel+=impulse*ib;
+    mesh.angularVel-=I0*glm::cross(r0,impulse);
+    body.angularVel+=I1*glm::cross(r1,impulse);
+    v0=mesh.vel+glm::cross(mesh.angularVel,r0);
+    v1=body.vel+glm::cross(body.angularVel,r1);
+    rv=v1-v0;
+    glm::vec3 tangent=rv-glm::dot(rv,normal)*normal;
+    const float tLen=glm::length(tangent);
+    if(tLen<1e-7f) return;
+    tangent/=tLen;
+    const glm::vec3 ta=glm::cross(r0,tangent),tb=glm::cross(r1,tangent);
+    const float td=im+ib+glm::dot(I0*ta,ta)+glm::dot(I1*tb,tb);
+    if(td<1e-9f) return;
+    const glm::vec3 friction=-tangent*std::min(tLen/td,0.82f*jn);
+    mesh.vel-=friction*im;body.vel+=friction*ib;
+    mesh.angularVel-=I0*glm::cross(r0,friction);
+    body.angularVel+=I1*glm::cross(r1,friction);
+}
+
+// A convex body's vertices almost never fall in the interior of the *small*
+// triangles created by CSG. Testing only those vertices therefore misses flat
+// face contacts, including two damaged boxes resting against each other.
+// Instead, clip the damaged surface triangles against the OTHER BODY'S VOLUME.
+// The resulting polygon is a real intersection patch, not a point sample.
+// If that body has also been drilled, subtract its cavities from the patch.
+// Each mesh/body pair is considered in both directions by physicsSubstep().
+namespace {
+struct SurfaceContact {
+    glm::vec3 point{0.0f};
+    glm::vec3 normal{0.0f, 1.0f, 0.0f};
+    float penetration = 0.0f;
+    float area = 0.0f;
+};
+
+static float polygonArea(const Destruction::Polygon& polygon) {
+    if (polygon.size() < 3) return 0.0f;
+    float area = 0.0f;
+    for (std::size_t j = 1; j + 1 < polygon.size(); ++j)
+        area += 0.5f * glm::length(glm::cross(
+            polygon[j] - polygon[0], polygon[j+1] - polygon[0]));
+    return area;
+}
+static glm::vec3 polygonCentroid(const Destruction::Polygon& polygon) {
+    glm::vec3 centroid(0.0f);
+    float area = 0.0f;
+    for (std::size_t j = 1; j + 1 < polygon.size(); ++j) {
+        const float a = 0.5f * glm::length(glm::cross(
+            polygon[j] - polygon[0],polygon[j+1] - polygon[0]));
+        centroid += (polygon[0] + polygon[j] + polygon[j+1]) * (a/3.0f);
+        area += a;
+    }
+    return area > 1e-9f ? centroid/area : polygon[0];
+}
+
+// Positive halfspace normals point OUT of the convex collider.
+static std::vector<Destruction::Plane> convexBodyPlanes(const Shape& body, float skin) {
+    std::vector<Destruction::Plane> planes;
+    if (body.type == ShapeType::Rect) {
+        const glm::vec3 h = glm::abs(body.scale) * 0.5f;
+        for (int axis = 0; axis < 3; ++axis) {
+            glm::vec3 local(0.0f);
+            local[axis] = 1.0f;
+            const glm::vec3 world = glm::normalize(body.rot * local);
+            planes.push_back({world, glm::dot(world,body.pos) + h[axis] + skin});
+            planes.push_back({-world,glm::dot(-world,body.pos)+ h[axis] + skin});
+        }
+    } else if (body.type == ShapeType::Pyramid && body.geometry.vertexCount >= 5) {
+        // Geometry faces are refreshed at the beginning of each solver pass.
+        for (int k = 0; k < body.geometry.faceCount; ++k) {
+            const Face& face = body.geometry.faces[k];
+            planes.push_back({face.n, -face.d + skin});
+        }
+    }
+    return planes;
+}
+
+// A clipped CSG triangle overlapping a convex *volume* does not necessarily
+// touch the convex body's *surface*. For example, when a small drilled box
+// rests on a wide undamaged box, its side walls intersect the lower box for
+// a tiny vertical strip. Treating those internal strips as side impacts
+// produces a large horizontal impulse and tips the resting box over.
+// Require an opposing face of the convex body close to the candidate patch.
+// Body planes already include `skin`; subtract it when measuring the actual
+// boundary. Opposing normals also keep cavity-wall/side-wall contacts valid.
+static bool opposingBoundaryNearby(
+    const glm::vec3& point, const glm::vec3& meshNormal,
+    const std::vector<Destruction::Plane>& planes, float skin)
+{
+    constexpr float maxInsideDepth = 0.025f;
+    constexpr float minOpposition = 0.55f;
+    for (const auto& plane : planes) {
+        if (glm::dot(meshNormal, plane.n) > -minOpposition) continue;
+        const float signedDistance = glm::dot(plane.n, point) - (plane.d - skin);
+        if (signedDistance >= -maxInsideDepth && signedDistance <= skin + 0.015f)
+            return true;
+    }
+    return false;
+}
+
+// Split off genuinely empty parts of the second damaged shape. Merely clipping
+// to its original convex hull would restore the invisible collider in a hole.
+static std::vector<Destruction::Polygon> removeBodyCavities(
+    const Shape& body, const Destruction::Polygon& patch,
+    const std::vector<std::vector<Destruction::Plane>>& cuts) {
+    if (cuts.empty()) return {patch};
+    std::vector<Destruction::Polygon> visible{patch};
+    const glm::quat inverse = glm::inverse(body.rot);
+    for (const auto& cutter : cuts) {
+        std::vector<Destruction::Polygon> next;
+        for (const auto& worldPart : visible) {
+            Destruction::Polygon local;
+            local.reserve(worldPart.size());
+            for (const glm::vec3& v : worldPart)
+                local.push_back(inverse * (v - body.pos));
+            // If any single plane excludes the WHOLE polygon, this cutter
+            // cannot remove any part of it. This is the common cheap path.
+            bool fullyOutside = false;
+            for (const auto& plane : cutter) {
+                bool outside = true;
+                for (const auto& v : local)
+                    if (glm::dot(plane.n, v) <= plane.d + 1.e-5f) {
+                        outside = false; break;
+                    }
+                if (outside) { fullyOutside = true; break; }
+            }
+            if (fullyOutside) {
+                next.push_back(worldPart);
+                continue;
+            }
+            std::vector<glm::vec3> fragments;
+            Destruction::outsideConvex(local, cutter, fragments);
+            for (std::size_t j=0; j+2 < fragments.size(); j+=3) {
+                next.push_back({body.pos + body.rot*fragments[j],
+                                body.pos + body.rot*fragments[j+1],
+                                body.pos + body.rot*fragments[j+2]});
+            }
+        }
+        visible = std::move(next);
+        if (visible.empty()) break;
+    }
+    return visible;
+}
+
+// Resting support is evaluated on the REAL clipped CSG patches. The support
+// polygon must enclose the projected centre of mass; two edge points, a thin
+// strip or contacts entirely on one side are not stable support.
+static bool centerInsideContactFootprint(const std::vector<glm::vec3>& points,
+                                         const glm::vec3& center) {
+    struct P { float x, y; };
+    std::vector<P> v;
+    v.reserve(points.size());
+    for (const glm::vec3& p : points) v.push_back({p.x, p.z});
+    if (v.size() < 3) return false;
+    std::sort(v.begin(), v.end(), [](const P& a,const P& b) {
+        return a.x == b.x ? a.y < b.y : a.x < b.x;
+    });
+    v.erase(std::unique(v.begin(),v.end(),[](const P& a,const P& b) {
+        return std::abs(a.x-b.x) < 1.e-5f && std::abs(a.y-b.y) < 1.e-5f;
+    }), v.end());
+    if (v.size() < 3) return false;
+    auto cross=[](const P& a,const P& b,const P& c) {
+        return (b.x-a.x)*(c.y-a.y)-(b.y-a.y)*(c.x-a.x);
+    };
+    std::vector<P> hull;
+    for (const P& p : v) {
+        while (hull.size()>=2 && cross(hull[hull.size()-2],hull.back(),p)<=1.e-7f)
+            hull.pop_back();
+        hull.push_back(p);
+    }
+    const std::size_t lower=hull.size();
+    for (std::size_t i=v.size()-1;i-- > 0;) {
+        const P& p=v[i];
+        while (hull.size()>lower && cross(hull[hull.size()-2],hull.back(),p)<=1.e-7f)
+            hull.pop_back();
+        hull.push_back(p);
+    }
+    if (hull.size()<4) return false;
+    hull.pop_back();
+    float twiceArea=0.0f;
+    for (std::size_t i=0;i<hull.size();++i) {
+        const auto& a=hull[i];const auto& b=hull[(i+1)%hull.size()];
+        twiceArea+=a.x*b.y-a.y*b.x;
+    }
+    if (twiceArea < 0.002f) return false;
+    // Leave a small safety margin: the body must not sleep on a knife edge.
+    const float margin=std::min(0.012f,0.06f*std::sqrt(twiceArea*0.5f));
+    const P c{center.x,center.z};
+    for (std::size_t i=0;i<hull.size();++i) {
+        const P& a=hull[i];const P& b=hull[(i+1)%hull.size()];
+        const float len=std::hypot(b.x-a.x,b.y-a.y);
+        if (len<1.e-6f || cross(a,b,c)<margin*len) return false;
+    }
+    return true;
+}
+
+static bool bottomFaceHorizontal(const Shape& top) {
+    if (top.type==ShapeType::Sphere) return true;
+    if (top.type!=ShapeType::Rect && top.type!=ShapeType::Pyramid) return false;
+    float alignment=0.0f;
+    const ContactPolygon face=supportingFace(top,glm::vec3(0,-1,0),&alignment);
+    return face.count>=3 && alignment>0.965f;
+}
+
+// Spatially distribute contacts across the intersection patch: up to eight
+// contacts instead of a huge impulse at every individual CSG triangle.
+static void storeContact(std::vector<SurfaceContact>& contacts,
+                         const SurfaceContact& candidate) {
+    if (candidate.area < 1.e-9f || candidate.penetration <= 0.0f) return;
+    for (auto& c : contacts) {
+        if (glm::dot(c.normal,candidate.normal) > 0.975f &&
+            glm::length2(c.point-candidate.point) < 0.065f*0.065f) {
+            if (candidate.area > c.area) c = candidate;
+            else c.penetration = std::max(c.penetration,candidate.penetration);
+            return;
+        }
+    }
+    constexpr std::size_t maximumCandidates = 64;
+    if (contacts.size() < maximumCandidates) contacts.push_back(candidate);
+    else {
+        const auto it = std::min_element(contacts.begin(),contacts.end(),
+            [](const auto& a,const auto& b){return a.area<b.area;});
+        if (it!=contacts.end() && candidate.area>it->area) *it=candidate;
+    }
+}
+} // anonymous namespace
+
+static void meshConvexContacts(Shape& mesh, Shape& body) {
+    if (!mesh.damage.active() || mesh.damage.triangles.empty()) return;
+    if (body.type != ShapeType::Rect && body.type != ShapeType::Pyramid &&
+        body.type != ShapeType::Sphere) return;
+
+    // Query the existing per-shape BVH in the mesh's local coordinates.
+    const AABB bounds=computeAABB(body);
+    const glm::quat inverse=glm::inverse(mesh.rot);
+    glm::vec3 lo(FLT_MAX),hi(-FLT_MAX);
+    for (int x=0;x<2;++x) for (int y=0;y<2;++y) for (int z=0;z<2;++z) {
+        const glm::vec3 v(x?bounds.max.x:bounds.min.x,
+                          y?bounds.max.y:bounds.min.y,
+                          z?bounds.max.z:bounds.min.z);
+        const glm::vec3 p=inverse*(v-mesh.pos);
+        lo=glm::min(lo,p);hi=glm::max(hi,p);
+    }
+    constexpr float skin=0.012f;
+    lo-=glm::vec3(skin); hi+=glm::vec3(skin);
+    std::vector<int> candidates;
+    if (!mesh.damage.bvh.empty()) {
+        std::vector<int> stack{0};
+        while (!stack.empty()) {
+            const int nodeIndex=stack.back();stack.pop_back();
+            const auto& node=mesh.damage.bvh[nodeIndex];
+            if (node.max.x < lo.x || node.min.x > hi.x ||
+                node.max.y < lo.y || node.min.y > hi.y ||
+                node.max.z < lo.z || node.min.z > hi.z) continue;
+            if (node.left>=0) {
+                stack.push_back(node.left);stack.push_back(node.right);
+            } else for (int k=0;k<node.count;++k)
+                candidates.push_back(mesh.damage.triangleOrder[node.first+k]);
+        }
+    } else for (int i=0;i<static_cast<int>(mesh.damage.triangles.size()/3);++i)
+        candidates.push_back(i);
+
+    const bool sphere=body.type==ShapeType::Sphere;
+    const float radius=sphere ? sphereRadius(body) : 0.0f;
+    const auto planes=sphere ? std::vector<Destruction::Plane>{} : convexBodyPlanes(body,skin);
+    if (!sphere && planes.empty()) return;
+    std::vector<std::vector<Destruction::Plane>> bodyCuts;
+    if (body.damage.active()) for (const auto& cut:body.damage.cuts)
+        bodyCuts.push_back(Destruction::cutterPlanes(cut));
+
+    std::vector<SurfaceContact> contacts;
+    contacts.reserve(32);
+    // Both orientations matter: the DAMAGED object can itself be the top one.
+    // n points away from the damaged mesh, so an upward normal supports body,
+    // while a downward normal means the damaged mesh rests on body.
+    std::vector<glm::vec3> bodyFootprint, meshFootprint;
+    bodyFootprint.reserve(64);
+    meshFootprint.reserve(64);
+    const auto& triangles=mesh.damage.triangles;
+    for (int tri:candidates) {
+        const std::size_t k=static_cast<std::size_t>(tri)*3;
+        if (k+2>=triangles.size()) continue;
+        const glm::vec3 a=mesh.pos+mesh.rot*triangles[k];
+        const glm::vec3 b=mesh.pos+mesh.rot*triangles[k+1];
+        const glm::vec3 c=mesh.pos+mesh.rot*triangles[k+2];
+        glm::vec3 n=glm::cross(b-a,c-a);
+        const float n2=glm::length2(n);
+        if (n2<1e-12f) continue;
+        n/=std::sqrt(n2);
+        if (sphere) {
+            const glm::vec3 q=closestPointTriangle(body.pos,a,b,c);
+            const glm::vec3 delta=body.pos-q;
+            const float d=glm::length(delta);
+            if (d>=radius+skin) continue;
+            // The other sphere may itself have a drilled-out cavity. Avoid
+            // reinstating an invisible collision surface inside that void.
+            if (body.damage.active()) {
+                const glm::vec3 local = glm::inverse(body.rot)*(q-body.pos);
+                bool removed = false;
+                for (const auto& cut:body.damage.cuts)
+                    if (Destruction::insideCut(cut,local)) {removed=true;break;}
+                if (removed) continue;
+            }
+            // This is a two-sided distance test for the triangle, but the
+            // correction direction MUST lead from solid into free space.
+            // Do not reverse a cavity's outward normal just because a sphere
+            // has already slightly penetrated its wall.
+            const float signedDistance=glm::dot(body.pos-a,n);
+            if (signedDistance < -radius-0.05f) continue;
+            const float penetration=std::min(0.10f,radius+skin-d);
+            storeContact(contacts,{q,n,penetration,0.003f});
+            if (n.y>0.92f) bodyFootprint.push_back(q);
+            if (n.y<-0.92f) meshFootprint.push_back(q);
+            continue;
+        }
+        Destruction::Polygon polygon{a,b,c};
+        for (const auto& plane:planes) {
+            polygon=Destruction::clipHalfspace(polygon,plane,true);
+            if (polygon.size()<3) break;
+        }
+        if (polygon.size()<3) continue;
+        // Determine how far the other body's solid crosses this surface.
+        // The CSG triangles themselves may be tiny, so checking only a few
+        // BODY VERTICES against them fails to find even face-on-face contact.
+        float minSigned=FLT_MAX;
+        for (int j=0;j<body.geometry.vertexCount;++j)
+            minSigned=std::min(minSigned,
+                glm::dot(body.geometry.vertices[j]-a,n));
+        if (minSigned>skin) continue;
+        const float penetration=std::clamp(skin-minSigned,0.0f,0.10f);
+        const auto remaining=removeBodyCavities(body,polygon,bodyCuts);
+        for (const auto& part:remaining) {
+            const float area=polygonArea(part);
+            if (area<1.e-8f) continue;
+            const glm::vec3 point=polygonCentroid(part);
+            // Reject false lateral contacts from triangles buried inside the
+            // other convex volume. A real contact must oppose one of the
+            // other object's nearby exterior faces.
+            if (!opposingBoundaryNearby(point,n,planes,skin)) continue;
+            storeContact(contacts,{point,n,penetration,area});
+            if (n.y>0.92f) {
+                for (const glm::vec3& vertex : part)
+                    if (bodyFootprint.size()<128) bodyFootprint.push_back(vertex);
+            } else if (n.y<-0.92f) {
+                for (const glm::vec3& vertex : part)
+                    if (meshFootprint.size()<128) meshFootprint.push_back(vertex);
+            }
+        }
+    }
+    // Mark support BEFORE solving impulses, even if both shapes are sleeping.
+    // Ground flags are recalculated every substep; a static/quiet base must
+    // keep its resting child awake only if a real support patch has vanished.
+    auto supportedByPatch=[](const Shape& top,
+                             const std::vector<glm::vec3>& patch) {
+        if (!bottomFaceHorizontal(top)) return false;
+        if (top.type == ShapeType::Sphere) {
+            for (const glm::vec3& point : patch)
+                if (glm::length2(glm::vec2(point.x-top.pos.x,
+                                            point.z-top.pos.z)) < 0.035f*0.035f)
+                    return true;
+            return false;
+        }
+        return centerInsideContactFootprint(patch,top.pos);
+    };
+    if (stationarySupport(mesh) && supportedByPatch(body,bodyFootprint)) {
+        body.isGrounded=true;
+        body.supportIsStable=true;
+    }
+    if (stationarySupport(body) && supportedByPatch(mesh,meshFootprint)) {
+        mesh.isGrounded=true;
+        mesh.supportIsStable=true;
+    }
+    if (contacts.empty()) return;
+    std::sort(contacts.begin(),contacts.end(),[](const auto& x,const auto& y) {
+        return x.area>y.area;
+    });
+    // Greedy spread: keep at most 8 separated points; distribute impulses so
+    // that broad, flat contacts do not collapse into one artificial torque.
+    std::vector<SurfaceContact> selected;
+    for (const auto& c:contacts) {
+        bool close=false;
+        for (const auto& prev:selected)
+            if (glm::dot(prev.normal,c.normal)>0.97f &&
+                glm::length2(prev.point-c.point)<0.09f*0.09f) {
+                close=true;break;
+            }
+        if (!close) selected.push_back(c);
+        if (selected.size()==8) break;
+    }
+    const float weight=1.0f/static_cast<float>(selected.size());
+    for (const auto& c:selected)
+        solveMeshPoint(mesh,body,c.point,c.normal,c.penetration,weight);
+}
+
 static bool spherePyramid(Shape& sphere, Shape& pyr, Contact& c)
 {
     const float r = sphereRadius(sphere);
@@ -1668,6 +2111,17 @@ static void updateSleepState(Shape& s, float dt)
     }
     const float linearThreshold = 0.085f;
     const float angularThreshold = 0.075f;
+    // Static friction at rest: erase numerical micro-sliding only when a
+    // verified support polygon holds the centre of mass and speeds are small.
+    // Do not damp falling, tipping or sliding bodies with unverified supports.
+    if (s.isGrounded && s.supportIsStable &&
+        glm::length2(s.vel)<0.22f*0.22f &&
+        glm::length2(s.angularVel)<0.28f*0.28f) {
+        s.vel.x *= 0.72f;
+        s.vel.z *= 0.72f;
+        s.angularVel *= 0.70f;
+        if (std::abs(s.vel.y)<0.14f) s.vel.y=0.0f;
+    }
     const bool quiet = glm::length2(s.vel) < linearThreshold*linearThreshold &&
                        glm::length2(s.angularVel) < angularThreshold*angularThreshold;
     if (!quiet || !s.isGrounded || !s.supportIsStable) {
@@ -1702,6 +2156,10 @@ static void physicsSubstep(Scene& scene, float dt)
         }
     };
     applyToAll([&](Shape& s) {
+        // The frame-wide support result is an OR across solver iterations,
+        // not the result of whichever contact happened to run last.
+        s.isGrounded = false;
+        s.supportIsStable = false;
         integrateGravity(s, dt);
         integratePosition(s, dt);
         integrateRotation(s, dt);
@@ -1725,35 +2183,35 @@ static void physicsSubstep(Scene& scene, float dt)
             pyramidAABB[i] = computeAABB(pyramids[i]);
 
         Contact c;
+        auto solvePair=[&](Shape& a,Shape& b,auto narrowphase){
+            if(a.damage.active() || b.damage.active()) {
+                if(a.damage.active()) meshConvexContacts(a,b);
+                if(b.damage.active()) meshConvexContacts(b,a);
+            } else if(narrowphase(a,b,c)) solveContact(c,dt);
+        };
         for (size_t i = 0; i < spheres.size(); ++i)
             for (size_t j = i + 1; j < spheres.size(); ++j)
-                if (aabbOverlap(sphereAABB[i], sphereAABB[j]) &&
-                    sphereSphere(spheres[i], spheres[j], c)) solveContact(c, dt);
+                if (aabbOverlap(sphereAABB[i], sphereAABB[j]) ) solvePair(spheres[i], spheres[j],sphereSphere);
 
         for (size_t i = 0; i < spheres.size(); ++i)
             for (size_t j = 0; j < boxes.size(); ++j)
-                if (aabbOverlap(sphereAABB[i], boxAABB[j]) &&
-                    sphereBox(spheres[i], boxes[j], c)) solveContact(c, dt);
+                if (aabbOverlap(sphereAABB[i], boxAABB[j]) ) solvePair(spheres[i], boxes[j],sphereBox);
 
         for (size_t i = 0; i < boxes.size(); ++i)
             for (size_t j = i + 1; j < boxes.size(); ++j)
-                if (aabbOverlap(boxAABB[i], boxAABB[j]) &&
-                    boxBox(boxes[i], boxes[j], c)) solveContact(c, dt);
+                if (aabbOverlap(boxAABB[i], boxAABB[j]) ) solvePair(boxes[i], boxes[j],boxBox);
 
         for (size_t i = 0; i < boxes.size(); ++i)
             for (size_t j = 0; j < pyramids.size(); ++j)
-                if (aabbOverlap(boxAABB[i], pyramidAABB[j]) &&
-                    boxPyramid(boxes[i], pyramids[j], c)) solveContact(c, dt);
+                if (aabbOverlap(boxAABB[i], pyramidAABB[j]) ) solvePair(boxes[i], pyramids[j],boxPyramid);
 
         for (size_t i = 0; i < spheres.size(); ++i)
             for (size_t j = 0; j < pyramids.size(); ++j)
-                if (aabbOverlap(sphereAABB[i], pyramidAABB[j]) &&
-                    spherePyramid(spheres[i], pyramids[j], c)) solveContact(c, dt);
+                if (aabbOverlap(sphereAABB[i], pyramidAABB[j]) ) solvePair(spheres[i], pyramids[j],spherePyramid);
 
         for (size_t i = 0; i < pyramids.size(); ++i)
             for (size_t j = i + 1; j < pyramids.size(); ++j)
-                if (aabbOverlap(pyramidAABB[i], pyramidAABB[j]) &&
-                    pyramidPyramid(pyramids[i], pyramids[j], c)) solveContact(c, dt);
+                if (aabbOverlap(pyramidAABB[i], pyramidAABB[j]) ) solvePair(pyramids[i], pyramids[j],pyramidPyramid);
     }
     applyToAll([&](Shape& s) { updateSleepState(s, dt); });
 }

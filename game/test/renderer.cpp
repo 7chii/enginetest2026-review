@@ -10,12 +10,18 @@
 #include <cmath>
 #include <algorithm>
 #include <iostream>
+#include <unordered_map>
+#include <limits>
 
 #include "scene.h"
 
 // Renderer implementation: compiles simple color shader and creates VAOs used by scene::drawScene.
 // Keeps state so main/app can be minimal.
 
+struct DamageGpu {
+    unsigned int vao=0, vbo=0;
+    std::uint32_t revision=std::numeric_limits<std::uint32_t>::max();
+};
 struct Renderer::Impl {
     unsigned int shaderProgram = 0;
     unsigned int shadowShaderProgram = 0;
@@ -26,6 +32,7 @@ struct Renderer::Impl {
     unsigned int vaoRect = 0;
     unsigned int vaoSphere = 0;
     unsigned int shotVAO = 0, shotVBO = 0;
+    std::unordered_map<int, DamageGpu> damagedGpu;
     unsigned int sphereIndexCount = 0;
     glm::vec3 prevCameraPos = glm::vec3(0.0f);
     float lastMouseX = 600.0f, lastMouseY = 400.0f;
@@ -59,6 +66,7 @@ static void drawSceneWithShadow(
     unsigned int vaoRect,
     unsigned int vaoSphere,
     int sphereIndexCount,
+    std::unordered_map<int, DamageGpu>& damagedGpu,
     const glm::mat4& view,
     const glm::mat4& projection
 );
@@ -70,6 +78,7 @@ static void drawOutlines(
     unsigned int vaoRect,
     unsigned int vaoSphere,
     int sphereIndexCount,
+    std::unordered_map<int, DamageGpu>& damagedGpu,
     const glm::mat4& view,
     const glm::mat4& projection
 );
@@ -305,6 +314,7 @@ void main() {
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), nullptr);
     glEnableVertexAttribArray(0);
     glBindVertexArray(0);
+
 }
 
 void Renderer::draw(const Scene& scene, const Camera& cam) {
@@ -343,10 +353,37 @@ void Renderer::draw(const Scene& scene, const Camera& cam) {
     glDrawArrays(GL_LINES, 0, 404);
 
     // draw scene objects with shading
-    drawSceneWithShadow(scene, _p->shadowShaderProgram, _p->vaoPyramid, _p->vaoRect, _p->vaoSphere, (int)_p->sphereIndexCount, view, proj);
+    drawSceneWithShadow(scene, _p->shadowShaderProgram, _p->vaoPyramid, _p->vaoRect, _p->vaoSphere, (int)_p->sphereIndexCount,
+                        _p->damagedGpu, view, proj);
 
     // draw outlines on top (depois de tudo)
-    drawOutlines(scene, _p->shadowShaderProgram, _p->vaoPyramid, _p->vaoRect, _p->vaoSphere, (int)_p->sphereIndexCount, view, proj);
+    drawOutlines(scene, _p->shadowShaderProgram, _p->vaoPyramid, _p->vaoRect, _p->vaoSphere, (int)_p->sphereIndexCount,
+                        _p->damagedGpu, view, proj);
+}
+
+// Damaged shapes retain a GPU vertex buffer keyed by stable shape ID.
+// glBufferData is only called when a shot changes the mesh revision.
+static unsigned int bindDamageMesh(std::unordered_map<int, DamageGpu>& cache,
+                                   const Shape& shape) {
+    auto& entry = cache[shape.id];
+    if (!entry.vao) {
+        glGenVertexArrays(1,&entry.vao);
+        glGenBuffers(1,&entry.vbo);
+        glBindVertexArray(entry.vao);
+        glBindBuffer(GL_ARRAY_BUFFER,entry.vbo);
+        glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,sizeof(glm::vec3),nullptr);
+        glEnableVertexAttribArray(0);
+    } else {
+        glBindVertexArray(entry.vao);
+        glBindBuffer(GL_ARRAY_BUFFER,entry.vbo);
+    }
+    if (entry.revision != shape.damage.revision) {
+        glBufferData(GL_ARRAY_BUFFER,
+            static_cast<GLsizeiptr>(shape.damage.triangles.size()*sizeof(glm::vec3)),
+            shape.damage.triangles.data(),GL_STATIC_DRAW);
+        entry.revision=shape.damage.revision;
+    }
+    return entry.vao;
 }
 
 //  objetos com sombreamento
@@ -357,6 +394,7 @@ static void drawSceneWithShadow(
     unsigned int vaoRect,
     unsigned int vaoSphere,
     int sphereIndexCount,
+    std::unordered_map<int, DamageGpu>& damagedGpu,
     const glm::mat4& view,
     const glm::mat4& projection
 ) {
@@ -365,16 +403,25 @@ static void drawSceneWithShadow(
     glUniformMatrix4fv(glGetUniformLocation(shadowShaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
 
     auto drawShape = [&](unsigned int vao, const Shape& s, int count, bool indexed, ShapeType t, int idx) {
+        const bool damaged = s.damage.active();
         glm::mat4 m = glm::translate(glm::mat4(1.0f), s.pos);
         m = m * glm::mat4_cast(s.rot);
-        m = glm::scale(m, s.scale);
+        if (!damaged) m = glm::scale(m, s.scale);
 
         glUniformMatrix4fv(glGetUniformLocation(shadowShaderProgram, "model"), 1, GL_FALSE, glm::value_ptr(m));
         glUniform3f(glGetUniformLocation(shadowShaderProgram, "baseColor"), 0.7f, 0.7f, 0.9f);
 
-        glBindVertexArray(vao);
-        if (indexed) glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT, 0);
-        else glDrawArrays(GL_TRIANGLES, 0, count);
+        if (damaged) {
+            if (!s.damage.triangles.empty()) {
+                bindDamageMesh(damagedGpu, s);
+                glDrawArrays(GL_TRIANGLES, 0,
+                             static_cast<GLsizei>(s.damage.triangles.size()));
+            }
+        } else {
+            glBindVertexArray(vao);
+            if (indexed) glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT, 0);
+            else glDrawArrays(GL_TRIANGLES, 0, count);
+        }
         };
 
     const auto& ps = scene.pyramidsRef();
@@ -400,6 +447,7 @@ static void drawOutlines(
     unsigned int vaoRect,
     unsigned int vaoSphere,
     int sphereIndexCount,
+    std::unordered_map<int, DamageGpu>& damagedGpu,
     const glm::mat4& view,
     const glm::mat4& projection
 ) {
@@ -420,16 +468,25 @@ static void drawOutlines(
         if (sel.type != t || sel.index != idx) return;  //so desenha se sel
 
         
+        const bool damaged = s.damage.active();
         glm::mat4 om = glm::translate(glm::mat4(1.0f), s.pos);
         om = om * glm::mat4_cast(s.rot);
-        om = glm::scale(om, s.scale);
+        if (!damaged) om = glm::scale(om, s.scale);
 
         glUniformMatrix4fv(glGetUniformLocation(shadowShaderProgram, "model"), 1, GL_FALSE, glm::value_ptr(om));
         glUniform3f(glGetUniformLocation(shadowShaderProgram, "baseColor"), 1.0f, 0.0f, 0.0f);  // vermei para outline
 
-        glBindVertexArray(vao);
-        if (indexed) glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT, 0);
-        else glDrawArrays(GL_TRIANGLES, 0, count);
+        if (damaged) {
+            if (!s.damage.triangles.empty()) {
+                bindDamageMesh(damagedGpu, s);
+                glDrawArrays(GL_TRIANGLES, 0,
+                             static_cast<GLsizei>(s.damage.triangles.size()));
+            }
+        } else {
+            glBindVertexArray(vao);
+            if (indexed) glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT, 0);
+            else glDrawArrays(GL_TRIANGLES, 0, count);
+        }
         };
 
     const auto& ps = scene.pyramidsRef();
